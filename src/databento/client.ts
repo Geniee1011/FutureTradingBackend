@@ -10,14 +10,25 @@
 const HIST_BASE = "https://hist.databento.com/v0";
 const PRICE_SCALE = 1e9;
 const UNDEF_PRICE = "9223372036854775807"; // INT64_MAX sentinel
+// Default per-request budget. Light calls (symbology, metadata, fast quote poll)
+// keep this; heavy historical fetches pass a longer one — Databento's first
+// timeseries.get_range for a dataset has notable cold-start latency.
 const REQUEST_TIMEOUT_MS = 10_000;
+export const HISTORY_TIMEOUT_MS = 30_000;
+/** Retries for heavy historical fetches (vs. 1 for the fast quote poll). */
+export const HISTORY_RETRIES = 2;
 
 /** fetch with a timeout and one retry, so a transient network blip self-heals. */
-async function fetchWithRetry(url: string, init: RequestInit, retries = 1): Promise<Response> {
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  retries = 1,
+  timeoutMs = REQUEST_TIMEOUT_MS,
+): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      return await fetch(url, { ...init, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) });
+      return await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     } catch (err) {
       lastErr = err;
       if (attempt < retries) await new Promise((r) => setTimeout(r, 400));
@@ -102,6 +113,8 @@ export class DatabentoClient {
     end?: string;
     limit?: number;
     stypeIn?: string;
+    retries?: number;
+    timeoutMs?: number;
   }): Promise<Record<string, unknown>[]> {
     const qs = new URLSearchParams({
       dataset: this.dataset,
@@ -114,9 +127,12 @@ export class DatabentoClient {
     if (params.end) qs.set("end", params.end);
     if (params.limit) qs.set("limit", String(params.limit));
 
-    const res = await fetchWithRetry(`${HIST_BASE}/timeseries.get_range?${qs.toString()}`, {
-      headers: { Authorization: this.authHeader() },
-    });
+    const res = await fetchWithRetry(
+      `${HIST_BASE}/timeseries.get_range?${qs.toString()}`,
+      { headers: { Authorization: this.authHeader() } },
+      params.retries,
+      params.timeoutMs,
+    );
 
     if (!res.ok) {
       const body = await res.text().catch(() => "");
@@ -158,6 +174,17 @@ export class DatabentoClient {
     return out;
   }
 
+  /** Resolve continuous symbols → numeric instrument_id (for live stream mapping). */
+  async resolveInstrumentIds(dbSymbols: string[], dateMs: number): Promise<Record<string, number>> {
+    const ids = await this.symbologyResolve(dbSymbols, "continuous", "instrument_id", dateMs);
+    const out: Record<string, number> = {};
+    for (const [sym, id] of Object.entries(ids)) {
+      const n = Number(id);
+      if (Number.isFinite(n)) out[sym] = n;
+    }
+    return out;
+  }
+
   private async symbologyResolve(
     symbols: string[],
     stypeIn: string,
@@ -188,7 +215,14 @@ export class DatabentoClient {
   }
 
   /** Fetch OHLCV bars. schema must be ohlcv-1s | ohlcv-1m | ohlcv-1h | ohlcv-1d. */
-  async ohlcv(dbSymbol: string, schema: string, startMs: number, endMs: number, limit?: number): Promise<OhlcvRecord[]> {
+  async ohlcv(
+    dbSymbol: string,
+    schema: string,
+    startMs: number,
+    endMs: number,
+    limit?: number,
+    opts?: { retries?: number; timeoutMs?: number },
+  ): Promise<OhlcvRecord[]> {
     // Clamp the window to available data (shift back, preserving width) so the
     // request never exceeds the dataset end (which Databento rejects with 422).
     const availEnd = await this.availableEnd(schema);
@@ -202,6 +236,8 @@ export class DatabentoClient {
       start: new Date(start).toISOString(),
       end: new Date(end).toISOString(),
       limit,
+      retries: opts?.retries,
+      timeoutMs: opts?.timeoutMs,
     });
     const out: OhlcvRecord[] = [];
     for (const r of records) {

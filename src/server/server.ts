@@ -5,8 +5,17 @@ import { INSTRUMENTS, SYMBOLS } from "../instruments.js";
 import type { AuthService } from "../auth/service.js";
 import { bearerToken, verifyToken } from "../auth/jwt.js";
 import { useDatabase } from "../config.js";
-import { getAccountIdByUserId, listOrders, listPositions } from "../trading/repository.js";
+import {
+  createEvaluationAccount,
+  getAccountDetail,
+  getAccountIdByUserId,
+  getEquityCurve,
+  listOrders,
+  listPositions,
+  listTransactions,
+} from "../trading/repository.js";
 import type { AccountStream } from "../realtime/account-stream.js";
+import type { OrderEngine, PlaceOrderInput } from "../trading/order-engine.js";
 
 interface ServerOptions {
   port: number;
@@ -14,6 +23,7 @@ interface ServerOptions {
   providerName: string;
   auth: AuthService;
   accountStream: AccountStream;
+  orderEngine: OrderEngine;
   /** Mutable root→contract-code map (filled in asynchronously after startup). */
   contractCodes: Record<string, string>;
 }
@@ -101,6 +111,24 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/orders" && req.method === "GET") {
     return void handleOrders(req, res);
   }
+  if (url.pathname === "/api/orders" && req.method === "POST") {
+    return void handlePlaceOrder(req, res, opts.orderEngine);
+  }
+  if (/^\/api\/orders\/[^/]+\/cancel$/.test(url.pathname) && req.method === "POST") {
+    return void handleCancelOrder(url, req, res, opts.orderEngine);
+  }
+  if (url.pathname === "/api/positions/close" && req.method === "POST") {
+    return void handleClosePosition(req, res, opts.orderEngine);
+  }
+  if (url.pathname === "/api/account" && req.method === "GET") {
+    return void handleAccount(req, res);
+  }
+  if (url.pathname === "/api/transactions" && req.method === "GET") {
+    return void handleTransactions(req, res);
+  }
+  if (url.pathname === "/api/equity-curve" && req.method === "GET") {
+    return void handleEquityCurve(req, res);
+  }
 
   if (url.pathname === "/health") {
     return json(res, 200, {
@@ -162,16 +190,34 @@ async function handleLogin(req: IncomingMessage, res: ServerResponse, auth: Auth
   json(res, 200, result);
 }
 
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
 async function handleRegister(req: IncomingMessage, res: ServerResponse, auth: AuthService) {
   const body = await readJson<{ email?: string; password?: string; name?: string }>(req);
-  if (!body?.email || !body?.password || !body?.name) {
-    return json(res, 400, { error: "name, email and password required" });
-  }
+  const name = body?.name?.trim();
+  const email = body?.email?.trim();
+  const password = body?.password ?? "";
+
+  if (!name || !email || !password) return json(res, 400, { error: "Name, email and password are required." });
+  if (name.length < 2) return json(res, 400, { error: "Please enter your full name." });
+  if (!EMAIL_RE.test(email)) return json(res, 400, { error: "Please enter a valid email address." });
+  if (password.length < 6) return json(res, 400, { error: "Password must be at least 6 characters." });
+
   try {
-    const result = await auth.register({ email: body.email, password: body.password, name: body.name });
+    const result = await auth.register({ email, password, name });
+    // Provision a default evaluation account so the new trader has real data.
+    if (useDatabase) {
+      try {
+        await createEvaluationAccount(result.user.id);
+      } catch (e) {
+        console.error("[register] account provisioning failed:", (e as Error).message);
+      }
+    }
     json(res, 201, result);
   } catch (err) {
-    json(res, 409, { error: (err as Error).message });
+    const message = (err as Error).message;
+    const status = message === "email already registered" ? 409 : 500;
+    json(res, status, { error: status === 409 ? "That email is already registered." : "Registration failed." });
   }
 }
 
@@ -201,6 +247,55 @@ async function handleOrders(req: IncomingMessage, res: ServerResponse) {
   const accountId = await requireAccount(req);
   if (!accountId) return json(res, 401, { error: "unauthorized" });
   json(res, 200, await listOrders(accountId));
+}
+
+async function handleAccount(req: IncomingMessage, res: ServerResponse) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const account = await getAccountDetail(accountId);
+  if (!account) return json(res, 404, { error: "account not found" });
+  json(res, 200, account);
+}
+
+async function handleTransactions(req: IncomingMessage, res: ServerResponse) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  json(res, 200, await listTransactions(accountId));
+}
+
+async function handleEquityCurve(req: IncomingMessage, res: ServerResponse) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  json(res, 200, await getEquityCurve(accountId));
+}
+
+async function handlePlaceOrder(req: IncomingMessage, res: ServerResponse, engine: OrderEngine) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const body = await readJson<PlaceOrderInput>(req);
+  if (!body?.symbol || !body.side || !body.type || !body.quantity) {
+    return json(res, 400, { error: "symbol, side, type and quantity are required" });
+  }
+  const result = await engine.place(accountId, body);
+  json(res, result.ok ? 201 : 400, result);
+}
+
+async function handleCancelOrder(url: URL, req: IncomingMessage, res: ServerResponse, engine: OrderEngine) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const orderId = url.pathname.split("/")[3]; // /api/orders/:id/cancel
+  if (!orderId) return json(res, 400, { error: "order id is required" });
+  const result = await engine.cancel(accountId, decodeURIComponent(orderId));
+  json(res, result.ok ? 200 : 400, result);
+}
+
+async function handleClosePosition(req: IncomingMessage, res: ServerResponse, engine: OrderEngine) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const body = await readJson<{ symbol?: string }>(req);
+  if (!body?.symbol) return json(res, 400, { error: "symbol is required" });
+  const result = await engine.closePosition(accountId, body.symbol);
+  json(res, result.ok ? 201 : 400, result);
 }
 
 /** Read and JSON-parse a request body (max 1 MB). */

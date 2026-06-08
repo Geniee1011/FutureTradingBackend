@@ -87,7 +87,8 @@ export class AccountStream {
     }
     if (msg.type === "subscribe" && msg.channel && ACCOUNT_CHANNELS.has(msg.channel)) {
       st.channels.add(msg.channel);
-      this.pushAccount(ws, st); // immediate snapshot
+      this.pushAccount(ws, st); // immediate per-position marks + account
+      if (msg.channel === "positions") this.pushPositionsSnapshot(ws, st); // full list incl. lifecycle
     }
     if (msg.type === "unsubscribe" && msg.channel) {
       st.channels.delete(msg.channel);
@@ -116,7 +117,48 @@ export class AccountStream {
 
   /** Reload an account's positions/balance (call after the order engine mutates it). */
   async refreshAccount(accountId: string) {
-    if (this.accounts.has(accountId)) await this.loadAccount(accountId);
+    await this.loadAccount(accountId);
+    // A fill may have opened, resized, flipped, or CLOSED a position. Per-position
+    // marks alone can't express a removal, so push the full list — subscribers
+    // replace their book and the engine's changes show up live.
+    this.broadcastPositions(accountId);
+  }
+
+  /** Current positions for an account, marked against the latest quotes. */
+  private livePositions(acc: CachedAccount): ApiPosition[] {
+    return acc.positions.map((p) => {
+      const mark = this.quotes.get(p.symbol) ?? p.markPrice ?? p.avgPrice;
+      const dir = p.side === "buy" ? 1 : -1;
+      return {
+        ...p,
+        markPrice: round(mark, 4),
+        unrealizedPnl: round((mark - p.avgPrice) * p.quantity * dir, 2),
+      };
+    });
+  }
+
+  /** Push the full positions list to an account's `positions` subscribers. */
+  broadcastPositions(accountId: string) {
+    const acc = this.accounts.get(accountId);
+    if (!acc) return;
+    this.sendToAccountChannel(accountId, "positions", {
+      type: "positions_snapshot",
+      channel: "positions",
+      positions: this.livePositions(acc),
+    });
+  }
+
+  /** Send the current positions snapshot to a single just-subscribed client. */
+  private pushPositionsSnapshot(ws: WebSocket, st: ClientState) {
+    const accountId = st.auth?.accountId;
+    if (!accountId || ws.readyState !== ws.OPEN) return;
+    const acc = this.accounts.get(accountId);
+    if (acc) this.send(ws, { type: "positions_snapshot", channel: "positions", positions: this.livePositions(acc) });
+  }
+
+  /** Latest known price for a symbol (used by the order engine to fill markets). */
+  getMarkPrice(symbol: string): number | undefined {
+    return this.quotes.get(symbol);
   }
 
   private tick() {

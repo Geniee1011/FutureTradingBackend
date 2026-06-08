@@ -54,9 +54,15 @@ export class MarketHub {
 
     if (msg.type === "subscribe") {
       if (msg.channel === "quotes") {
-        if (msg.symbol) state.quoteSymbols.add(msg.symbol);
-        else for (const s of SYMBOLS) state.quoteSymbols.add(s); // no symbol = all
+        const added = msg.symbol ? [msg.symbol] : [...SYMBOLS]; // no symbol = all
+        for (const s of added) state.quoteSymbols.add(s);
         this.recomputeQuotes();
+        // Send the last known quote immediately so the client isn't blank until
+        // the next tick (important when the market is closed / between trades).
+        for (const s of added) {
+          const snap = this.provider.getQuoteSnapshot(s);
+          if (snap && ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: "quote", data: snap }));
+        }
       } else if (msg.channel === "orderbook" && msg.symbol) {
         state.books.add(msg.symbol);
         this.recomputeBooks();

@@ -20,6 +20,8 @@ export const config = {
     apiKey: process.env.DATABENTO_API_KEY?.trim() ?? "",
     dataset: process.env.DATABENTO_DATASET?.trim() || "GLBX.MDP3",
     quotePollMs: num("QUOTE_POLL_MS", 1500),
+    /** Use the real-time Live TCP feed instead of Historical HTTP polling. */
+    live: process.env.DATABENTO_LIVE === "1",
   },
 } as const;
 

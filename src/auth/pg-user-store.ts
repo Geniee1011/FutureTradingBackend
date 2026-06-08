@@ -30,13 +30,19 @@ export class PgUserStore implements UserStore {
   }
 
   async create(input: { email: string; password: string; name: string; role?: Role }): Promise<User> {
-    const { rows } = await getPool().query<UserRow>(
-      `INSERT INTO "User" ("email","passwordHash","name","role")
-       VALUES ($1,$2,$3,$4)
-       RETURNING ${COLS}`,
-      [input.email.toLowerCase(), hashPassword(input.password), input.name, input.role ?? "TRADER"],
-    );
-    return this.map(rows[0]!);
+    try {
+      const { rows } = await getPool().query<UserRow>(
+        `INSERT INTO "User" ("email","passwordHash","name","role")
+         VALUES ($1,$2,$3,$4)
+         RETURNING ${COLS}`,
+        [input.email.toLowerCase(), hashPassword(input.password), input.name, input.role ?? "TRADER"],
+      );
+      return this.map(rows[0]!);
+    } catch (err) {
+      // 23505 = unique_violation (email already exists)
+      if ((err as { code?: string }).code === "23505") throw new Error("email already registered");
+      throw err;
+    }
   }
 
   private map(r: UserRow): User {

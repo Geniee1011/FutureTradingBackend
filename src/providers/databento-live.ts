@@ -1,0 +1,294 @@
+import net from "node:net";
+import { createHash } from "node:crypto";
+import { BaseProvider, round } from "./provider.js";
+import { DatabentoClient } from "../databento/client.js";
+import { DbnDecoder, type DecodedBook, type DecodedRecord, type DecodedTrade } from "../databento/dbn.js";
+import { fetchDailyStats, fetchHistory } from "./databento-shared.js";
+import { INSTRUMENTS, getInstrument } from "../instruments.js";
+import type { Candle } from "../types.js";
+
+/* ------------------------------------------------------------------ *
+ * DatabentoLiveProvider — true real-time via the Databento Live raw-TCP
+ * gateway (CRAM auth + DBN binary stream). Streams `trades` for all roots and
+ * emits quotes on every print. Hybrid: still uses the Historical HTTP client
+ * for chart history (getHistory) and rolling-24h stats.
+ *
+ * Handshake (proven): connect → greeting + `cram=` → send auth → `success=` →
+ * send subscription + start_session → DBN binary stream.
+ * ------------------------------------------------------------------ */
+
+const LIVE_PORT = 13000;
+const DAILY_POLL_MS = 30_000;
+const BASE_BACKOFF_MS = 1_000;
+const MAX_BACKOFF_MS = 15_000;
+// Coalesce book updates: mbp-10 can tick many times per millisecond on liquid
+// contracts, but the UI only needs a fresh snapshot a few times per second.
+const BOOK_THROTTLE_MS = 150;
+
+interface SymState {
+  price: number;
+  priceTs: number;
+  dayOpen: number;
+  high: number;
+  low: number;
+  volume: number;
+  havePrice: boolean;
+  haveStats: boolean;
+}
+
+export class DatabentoLiveProvider extends BaseProvider {
+  readonly name = "databento-live";
+  private readonly client: DatabentoClient;
+  private readonly host: string;
+  private socket: net.Socket | null = null;
+  private decoder = new DbnDecoder();
+  private state = new Map<string, SymState>();
+  private idToSymbol = new Map<number, string>();
+  private bookEmitAt = new Map<string, number>(); // per-symbol throttle clock
+  private streaming = false;
+  private textBuf: Buffer = Buffer.alloc(0);
+  private running = false;
+  private retries = 0;
+  private reconnectTimer: NodeJS.Timeout | null = null;
+  private dailyTimer: NodeJS.Timeout | null = null;
+  private failing = false;
+  private lastErrorLogAt = 0;
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly dataset: string,
+  ) {
+    super();
+    this.client = new DatabentoClient(apiKey, dataset);
+    this.host = `${dataset.toLowerCase().replace(/\./g, "-")}.lsg.databento.com`;
+    for (const inst of INSTRUMENTS) {
+      this.state.set(inst.symbol, {
+        price: inst.simBase, priceTs: 0, dayOpen: 0, high: 0, low: 0, volume: 0, havePrice: false, haveStats: false,
+      });
+    }
+  }
+
+  start(): void {
+    if (this.running) return;
+    this.running = true;
+    void this.resolveIds();
+    void this.pollDaily();
+    this.scheduleDaily();
+    this.connect();
+  }
+
+  stop(): void {
+    this.running = false;
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    if (this.dailyTimer) clearTimeout(this.dailyTimer);
+    this.reconnectTimer = this.dailyTimer = null;
+    this.socket?.destroy();
+    this.socket = null;
+  }
+
+  async getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]> {
+    const inst = getInstrument(symbol);
+    if (!inst) return [];
+    return fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision);
+  }
+
+  /** Resolve each root's current dated contract code (e.g. ES → ESM6). */
+  async resolveContractCodes(): Promise<Record<string, string>> {
+    try {
+      const resolved = await this.client.resolveContracts(INSTRUMENTS.map((i) => i.databentoSymbol), Date.now());
+      const out: Record<string, string> = {};
+      for (const inst of INSTRUMENTS) {
+        const code = resolved[inst.databentoSymbol];
+        if (code) out[inst.symbol] = code;
+      }
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
+  // --- instrument id mapping ---------------------------------------
+
+  private async resolveIds(): Promise<void> {
+    try {
+      const map = await this.client.resolveInstrumentIds(INSTRUMENTS.map((i) => i.databentoSymbol), Date.now());
+      for (const inst of INSTRUMENTS) {
+        const id = map[inst.databentoSymbol];
+        if (id) this.idToSymbol.set(id, inst.symbol);
+      }
+    } catch (err) {
+      this.logError(err);
+    }
+  }
+
+  // --- live TCP connection -----------------------------------------
+
+  private connect(): void {
+    this.streaming = false;
+    this.textBuf = Buffer.alloc(0);
+    this.decoder.reset();
+
+    const socket = net.connect(LIVE_PORT, this.host);
+    this.socket = socket;
+    socket.on("connect", () => {
+      this.retries = 0;
+    });
+    socket.on("data", (chunk) => this.onData(chunk));
+    socket.on("error", () => {}); // close handler schedules reconnect
+    socket.on("close", () => {
+      if (this.socket === socket) this.socket = null;
+      if (this.running) this.scheduleReconnect();
+    });
+  }
+
+  private scheduleReconnect(): void {
+    const delay = Math.min(BASE_BACKOFF_MS * 2 ** this.retries, MAX_BACKOFF_MS);
+    this.retries += 1;
+    this.logError(new Error(`live disconnected — reconnecting in ${delay}ms`));
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+  }
+
+  private onData(chunk: Buffer): void {
+    if (this.streaming) {
+      for (const r of this.decoder.feed(chunk)) this.onRecord(r);
+      return;
+    }
+    this.textBuf = Buffer.concat([this.textBuf, chunk]);
+    while (!this.streaming) {
+      const nl = this.textBuf.indexOf(0x0a);
+      if (nl < 0) break;
+      const line = this.textBuf.subarray(0, nl).toString("utf8");
+      this.textBuf = this.textBuf.subarray(nl + 1);
+      this.handleLine(line);
+    }
+    // Anything left after start_session is the DBN stream.
+    if (this.streaming && this.textBuf.length) {
+      for (const r of this.decoder.feed(this.textBuf)) this.onRecord(r);
+      this.textBuf = Buffer.alloc(0);
+    }
+  }
+
+  private handleLine(line: string): void {
+    if (line.startsWith("cram=")) {
+      const challenge = line.slice(5).trim();
+      const sha = createHash("sha256").update(`${challenge}|${this.apiKey}`).digest("hex");
+      const response = `${sha}-${this.apiKey.slice(-5)}`;
+      this.socket?.write(`auth=${response}|dataset=${this.dataset}|encoding=dbn|ts_out=0\n`);
+    } else if (line.startsWith("success=")) {
+      const symbols = INSTRUMENTS.map((i) => i.databentoSymbol).join(",");
+      // No `start` field → live subscription from now (empty start is rejected).
+      this.socket?.write(`schema=trades|stype_in=continuous|symbols=${symbols}\n`);
+      // Real depth book: top-10 market-by-price. Each mbp-10 message is a full
+      // top-10 snapshot, so no incremental book state has to be maintained.
+      this.socket?.write(`schema=mbp-10|stype_in=continuous|symbols=${symbols}\n`);
+      this.socket?.write(`start_session=0\n`);
+      this.streaming = true;
+      this.logRecovered();
+      console.log("[live] authenticated — streaming trades + mbp-10 book for", INSTRUMENTS.length, "instruments");
+    } else if (line.startsWith("error=")) {
+      this.logError(new Error(line));
+      this.socket?.destroy();
+    }
+  }
+
+  private onRecord(r: DecodedRecord): void {
+    if (r.kind === "trade") this.onTrade(r);
+    else this.onBook(r);
+  }
+
+  private onTrade(t: DecodedTrade): void {
+    const symbol = this.idToSymbol.get(t.instrumentId);
+    if (!symbol) return;
+    const st = this.state.get(symbol);
+    if (!st) return;
+    st.price = t.price;
+    st.priceTs = t.ts;
+    st.havePrice = true;
+    if (st.haveStats) {
+      st.high = Math.max(st.high, t.price);
+      st.low = Math.min(st.low, t.price);
+    }
+    this.emitQuote(symbol, st);
+  }
+
+  // --- 24h stats (Historical HTTP) ---------------------------------
+
+  private scheduleDaily(): void {
+    const tick = async () => {
+      await this.pollDaily();
+      if (this.running) this.dailyTimer = setTimeout(tick, DAILY_POLL_MS);
+    };
+    this.dailyTimer = setTimeout(tick, DAILY_POLL_MS);
+  }
+
+  private async pollDaily(): Promise<void> {
+    await Promise.all(
+      INSTRUMENTS.map(async (inst) => {
+        const st = this.state.get(inst.symbol)!;
+        try {
+          const stats = await fetchDailyStats(this.client, inst.databentoSymbol);
+          if (stats) {
+            st.dayOpen = stats.dayOpen;
+            st.high = Math.max(stats.high, st.havePrice ? st.price : stats.high);
+            st.low = Math.min(stats.low, st.havePrice ? st.price : stats.low);
+            st.volume = stats.volume;
+            st.haveStats = true;
+            if (!st.havePrice) st.price = stats.close;
+            this.emitQuote(inst.symbol, st); // refresh change/high/low even without a trade
+          }
+        } catch (err) {
+          this.logError(err);
+        }
+      }),
+    );
+  }
+
+  private emitQuote(symbol: string, st: SymState): void {
+    const inst = getInstrument(symbol)!;
+    const p = inst.pricePrecision;
+    const spread = inst.tickSize;
+    this.emit("quote", {
+      symbol,
+      price: round(st.price, p),
+      bid: round(st.price - spread, p),
+      ask: round(st.price + spread, p),
+      change24h: st.haveStats && st.dayOpen > 0 ? (st.price - st.dayOpen) / st.dayOpen : 0,
+      high24h: round(st.haveStats ? Math.max(st.high, st.price) : st.price, p),
+      low24h: round(st.haveStats ? Math.min(st.low, st.price) : st.price, p),
+      volume24h: st.haveStats ? Math.round(st.volume) : 0,
+      ts: st.priceTs || Date.now(),
+    });
+  }
+
+  /** Emit a real top-10 book from an mbp-10 snapshot, throttled and only for watched symbols. */
+  private onBook(b: DecodedBook): void {
+    const symbol = this.idToSymbol.get(b.instrumentId);
+    if (!symbol || !this.bookSymbols.has(symbol)) return;
+    const now = Date.now();
+    if (now - (this.bookEmitAt.get(symbol) ?? 0) < BOOK_THROTTLE_MS) return;
+    this.bookEmitAt.set(symbol, now);
+    const p = getInstrument(symbol)!.pricePrecision;
+    this.emit("orderbook", {
+      symbol,
+      bids: b.bids.map((l) => ({ price: round(l.price, p), size: l.size })),
+      asks: b.asks.map((l) => ({ price: round(l.price, p), size: l.size })),
+      ts: b.ts || now,
+    });
+  }
+
+  private logError(err: unknown): void {
+    const now = Date.now();
+    if (this.failing && now - this.lastErrorLogAt < 30_000) return;
+    this.failing = true;
+    this.lastErrorLogAt = now;
+    const e = err as { message?: string; cause?: { code?: string } };
+    console.warn(`[live] ${e?.cause?.code ?? e?.message ?? "request failed"}`);
+  }
+
+  private logRecovered(): void {
+    if (!this.failing) return;
+    this.failing = false;
+    console.log("[live] connection recovered");
+  }
+}

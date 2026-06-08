@@ -14,6 +14,7 @@ DO $$ BEGIN CREATE TYPE "OrderStatus"     AS ENUM ('PENDING','FILLED','PARTIALLY
 DO $$ BEGIN CREATE TYPE "ViolationType"   AS ENUM ('DAILY_LOSS_EXCEEDED','MAX_DRAWDOWN_BREACHED','CONTRACT_LIMIT_EXCEEDED','RESTRICTED_INSTRUMENT'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 DO $$ BEGIN CREATE TYPE "ViolationAction" AS ENUM ('REJECT_ORDER','LIQUIDATE_POSITION','SUSPEND_ACCOUNT'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 DO $$ BEGIN CREATE TYPE "ActivityType"    AS ENUM ('USER_LOGIN','ORDER_PLACEMENT','ORDER_FILLED','ORDER_CANCELLED','ORDER_REJECTED','POSITION_OPENED','POSITION_CLOSED','RULE_VIOLATION','ACCOUNT_PASSED','ACCOUNT_SUSPENSION'); EXCEPTION WHEN duplicate_object THEN null; END $$;
+DO $$ BEGIN CREATE TYPE "TransactionType" AS ENUM ('DEPOSIT','WITHDRAWAL','FEE','TRADE','FUNDING'); EXCEPTION WHEN duplicate_object THEN null; END $$;
 
 -- ----------------------------- Tables ----------------------------
 CREATE TABLE IF NOT EXISTS "User" (
@@ -118,3 +119,13 @@ CREATE TABLE IF NOT EXISTS "ActivityLog" (
 );
 CREATE INDEX IF NOT EXISTS "ActivityLog_accountId_createdAt_idx" ON "ActivityLog" ("accountId","createdAt");
 CREATE INDEX IF NOT EXISTS "ActivityLog_type_idx" ON "ActivityLog" ("type");
+
+CREATE TABLE IF NOT EXISTS "Transaction" (
+  "id"          text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  "accountId"   text NOT NULL REFERENCES "Account"("id") ON DELETE CASCADE,
+  "type"        "TransactionType" NOT NULL,
+  "amount"      numeric(18,2) NOT NULL,
+  "description" text,
+  "createdAt"   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS "Transaction_accountId_createdAt_idx" ON "Transaction" ("accountId","createdAt");

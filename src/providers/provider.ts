@@ -18,6 +18,8 @@ export interface MarketDataProvider extends EventEmitter {
   setBookSymbols(symbols: Set<string>): void;
   /** Historical OHLCV candles, newest last. resolutionSec e.g. 60, 300, 3600. */
   getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]>;
+  /** Last quote emitted for a symbol, if any (for snapshot-on-subscribe). */
+  getQuoteSnapshot(symbol: string): Quote | undefined;
   /** Human-readable source name for /health and logs. */
   readonly name: string;
 
@@ -32,10 +34,21 @@ export abstract class BaseProvider extends EventEmitter implements MarketDataPro
   abstract readonly name: string;
   protected quoteSymbols = new Set<string>();
   protected bookSymbols = new Set<string>();
+  private lastQuotes = new Map<string, Quote>();
 
   abstract start(): void;
   abstract stop(): void;
   abstract getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]>;
+
+  /** Cache every emitted quote so new subscribers can be sent a snapshot. */
+  override emit(event: string | symbol, ...args: unknown[]): boolean {
+    if (event === "quote") this.lastQuotes.set((args[0] as Quote).symbol, args[0] as Quote);
+    return super.emit(event, ...args);
+  }
+
+  getQuoteSnapshot(symbol: string): Quote | undefined {
+    return this.lastQuotes.get(symbol);
+  }
 
   setQuoteSymbols(symbols: Set<string>): void {
     this.quoteSymbols = new Set(symbols);

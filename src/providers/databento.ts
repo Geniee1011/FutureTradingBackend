@@ -1,5 +1,5 @@
 import { BaseProvider, round, synthBook } from "./provider.js";
-import { DatabentoClient } from "../databento/client.js";
+import { DatabentoClient, HISTORY_TIMEOUT_MS, HISTORY_RETRIES } from "../databento/client.js";
 import { INSTRUMENTS, getInstrument, type Instrument } from "../instruments.js";
 import type { Candle } from "../types.js";
 
@@ -37,6 +37,7 @@ export class DatabentoProvider extends BaseProvider {
   private failing = false;
   private lastErrorLogAt = 0;
   private lastErr: unknown = null;
+  private running = false;
 
   constructor(apiKey: string, dataset: string, private readonly quotePollMs: number) {
     super();
@@ -56,19 +57,34 @@ export class DatabentoProvider extends BaseProvider {
   }
 
   start(): void {
-    if (this.quoteTimer) return;
-    // Start price polling immediately; the 24h stats (pollDaily) fill in
-    // alongside so quotes flow within the first cycle instead of waiting on it.
+    if (this.running) return;
+    this.running = true;
+    // Self-scheduling loops: the next poll is queued only AFTER the current one
+    // finishes, so slow requests can never make cycles overlap and pile up.
     void this.pollDaily();
-    void this.pollQuotes();
-    this.quoteTimer = setInterval(() => void this.pollQuotes(), this.quotePollMs);
-    this.dailyTimer = setInterval(() => void this.pollDaily(), DAILY_POLL_MS);
+    this.runLoop("quotes", () => this.pollQuotes(), this.quotePollMs, 0);
+    this.runLoop("daily", () => this.pollDaily(), DAILY_POLL_MS, DAILY_POLL_MS);
   }
 
   stop(): void {
-    if (this.quoteTimer) clearInterval(this.quoteTimer);
-    if (this.dailyTimer) clearInterval(this.dailyTimer);
+    this.running = false;
+    if (this.quoteTimer) clearTimeout(this.quoteTimer);
+    if (this.dailyTimer) clearTimeout(this.dailyTimer);
     this.quoteTimer = this.dailyTimer = null;
+  }
+
+  /** Run `fn` repeatedly, waiting `intervalMs` AFTER each completion (no overlap). */
+  private runLoop(kind: "quotes" | "daily", fn: () => Promise<void>, intervalMs: number, delayMs: number): void {
+    const tick = async () => {
+      await fn().catch(() => {});
+      if (!this.running) return;
+      const handle = setTimeout(tick, intervalMs);
+      if (kind === "quotes") this.quoteTimer = handle;
+      else this.dailyTimer = handle;
+    };
+    const first = setTimeout(tick, delayMs);
+    if (kind === "quotes") this.quoteTimer = first;
+    else this.dailyTimer = first;
   }
 
   /** Only the instruments clients are actually watching. */
@@ -148,6 +164,8 @@ export class DatabentoProvider extends BaseProvider {
             "ohlcv-1h",
             Date.now() - 25 * 3600_000,
             Date.now(),
+            undefined,
+            { timeoutMs: HISTORY_TIMEOUT_MS, retries: HISTORY_RETRIES },
           );
           const window = bars.slice(-24); // last 24 hourly bars = rolling 24h
           if (window.length > 0) {
@@ -196,15 +214,19 @@ export class DatabentoProvider extends BaseProvider {
     const native: Record<number, string> = { 1: "ohlcv-1s", 60: "ohlcv-1m", 3600: "ohlcv-1h", 86400: "ohlcv-1d" };
     const nativeSchema = native[resolutionSec];
 
+    // Historical fetches get a generous timeout + extra retry: Databento's first
+    // timeseries.get_range for a dataset has notable cold-start latency.
+    const histOpts = { timeoutMs: HISTORY_TIMEOUT_MS, retries: HISTORY_RETRIES };
+
     if (nativeSchema) {
       const startMs = Date.now() - count * resolutionSec * 1000 * 1.5 - 60_000;
-      const bars = await this.client.ohlcv(inst.databentoSymbol, nativeSchema, startMs, Date.now());
+      const bars = await this.client.ohlcv(inst.databentoSymbol, nativeSchema, startMs, Date.now(), undefined, histOpts);
       return bars.slice(-count).map((b) => toCandle(b, p));
     }
 
     // Aggregate 1m bars into the requested resolution (e.g. 5m, 15m).
     const startMs = Date.now() - count * resolutionSec * 1000 * 1.5 - 60_000;
-    const minutes = await this.client.ohlcv(inst.databentoSymbol, "ohlcv-1m", startMs, Date.now());
+    const minutes = await this.client.ohlcv(inst.databentoSymbol, "ohlcv-1m", startMs, Date.now(), undefined, histOpts);
     return aggregate(minutes, resolutionSec, p).slice(-count);
   }
 

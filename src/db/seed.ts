@@ -90,6 +90,36 @@ async function main() {
         [accountId, o.symbol, o.side, o.type, o.status, o.qty, o.filled, o.req, o.fill],
       );
     }
+
+    // Transaction history.
+    await pool.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
+    const txns = [
+      { type: "DEPOSIT", amount: 50000, desc: "Initial deposit", daysAgo: 30 },
+      { type: "TRADE", amount: 1240.0, desc: "Realized P&L · ES", daysAgo: 3 },
+      { type: "FEE", amount: -4.5, desc: "Trading commission", daysAgo: 3 },
+      { type: "TRADE", amount: -380.5, desc: "Realized P&L · NQ", daysAgo: 2 },
+      { type: "FUNDING", amount: -12.2, desc: "Overnight funding", daysAgo: 1 },
+      { type: "FEE", amount: -8.0, desc: "Trading commission", daysAgo: 0 },
+    ];
+    for (const t of txns) {
+      await pool.query(
+        `INSERT INTO "Transaction" ("accountId","type","amount","description","createdAt")
+         VALUES ($1,$2,$3,$4,$5)`,
+        [accountId, t.type, t.amount, t.desc, new Date(Date.now() - t.daysAgo * 86_400_000)],
+      );
+    }
+
+    // Keep the account balance consistent with the transaction ledger so the
+    // equity curve (cumulative transactions) ends at the shown balance.
+    await pool.query(
+      `UPDATE "Account" SET
+         "balance" = sub.total, "equity" = sub.total,
+         "highestEquity" = GREATEST("highestEquity", sub.total),
+         "totalPnl" = sub.total - "startingBalance", "updatedAt" = now()
+       FROM (SELECT COALESCE(SUM("amount"), 0) AS total FROM "Transaction" WHERE "accountId" = $1) sub
+       WHERE "id" = $1`,
+      [accountId],
+    );
   }
 
   const { rows: count } = await pool.query<{ n: string }>(`SELECT count(*)::text AS n FROM "User"`);
