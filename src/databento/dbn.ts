@@ -31,6 +31,7 @@ export interface DecodedTrade {
   kind: "trade";
   instrumentId: number;
   price: number;
+  size: number; // contracts in this print (uint32 at offset 24)
   ts: number; // epoch ms (from ts_event nanoseconds)
 }
 
@@ -92,6 +93,7 @@ export class DbnDecoder {
           instrumentId: this.buf.readUInt32LE(4),
           ts: Number(this.buf.readBigUInt64LE(8) / 1_000_000n),
           price: Number(this.buf.readBigInt64LE(HEADER_BYTES)) / PRICE_SCALE,
+          size: recBytes >= 28 ? this.buf.readUInt32LE(24) : 0,
         });
       } else if (rtype === RTYPE_MBP10 && recBytes >= MBP10_MIN_BYTES) {
         out.push(decodeMbp10(this.buf));

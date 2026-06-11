@@ -100,8 +100,10 @@ export class OrderEngine {
         return { ok: false, error: `Account is ${acc.status} — trading is disabled.` };
       }
       if (acc?.allowedInstruments?.length && !acc.allowedInstruments.includes(input.symbol)) {
-        await client.query("ROLLBACK");
-        return { ok: false, error: `${input.symbol} is not allowed on this account.` };
+        const detail = `${input.symbol} is not allowed on this account.`;
+        await this.recordViolation(client, accountId, "RESTRICTED_INSTRUMENT", detail);
+        await client.query("COMMIT"); // persist the violation (only SELECTs preceded it)
+        return { ok: false, error: detail };
       }
 
       const isMarket = input.type === "market";
@@ -125,8 +127,10 @@ export class OrderEngine {
       const existing = await this.getPosition(client, accountId, input.symbol);
       const netAfter = this.netSizeAfter(existing, input.side, input.quantity);
       if (acc?.maxContracts && netAfter > acc.maxContracts) {
-        await client.query("ROLLBACK");
-        return { ok: false, error: `Exceeds max position size (${acc.maxContracts} contracts).` };
+        const detail = `Order would exceed max position size (${acc.maxContracts} contracts).`;
+        await this.recordViolation(client, accountId, "CONTRACT_LIMIT_EXCEEDED", detail);
+        await client.query("COMMIT"); // persist the violation
+        return { ok: false, error: detail };
       }
 
       // Fill it: order + fill + position + account.
@@ -243,6 +247,7 @@ export class OrderEngine {
          VALUES ($1,$2,$3,$4,$5)`,
         [accountId, symbol, side === "buy" ? "LONG" : "SHORT", qty, round(fillPrice)],
       );
+      await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty} ${symbol} @ ${round(fillPrice)}`);
       return 0;
     }
 
@@ -271,12 +276,15 @@ export class OrderEngine {
       ]);
     } else if (qty === existing.quantity) {
       await client.query(`DELETE FROM "Position" WHERE "id" = $1`, [existing.id]);
+      await this.log(client, accountId, "POSITION_CLOSED", `${symbol} flat (realized ${realized})`);
     } else {
       // Flip to the opposite side with the remainder.
       await client.query(
         `UPDATE "Position" SET "side" = $2, "quantity" = $3, "averagePrice" = $4, "realizedPnl" = "realizedPnl" + $5, "updatedAt" = now() WHERE "id" = $1`,
         [existing.id, side === "buy" ? "LONG" : "SHORT", qty - existing.quantity, round(fillPrice), realized],
       );
+      await this.log(client, accountId, "POSITION_CLOSED", `${existing.side.toLowerCase()} ${symbol} closed (realized ${realized})`);
+      await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty - existing.quantity} ${symbol} @ ${round(fillPrice)}`);
     }
     return realized;
   }
@@ -383,7 +391,7 @@ export class OrderEngine {
 
       const existing = await this.getPosition(client, o.accountId, o.symbol);
       if (acc?.maxContracts && this.netSizeAfter(existing, side, qty) > acc.maxContracts) {
-        await this.rejectOrder(client, o, `exceeds max ${acc.maxContracts} contracts`);
+        await this.rejectOrder(client, o, `exceeds max ${acc.maxContracts} contracts`, "CONTRACT_LIMIT_EXCEEDED");
         await client.query("COMMIT");
         this.accountStream.publishOrderUpdate(o.accountId, { id: o.id, status: "rejected", symbol: o.symbol });
         return;
@@ -407,8 +415,11 @@ export class OrderEngine {
     }
   }
 
-  private async rejectOrder(client: PoolClient, o: WorkingOrder, reason: string) {
+  private async rejectOrder(client: PoolClient, o: WorkingOrder, reason: string, violationType?: string) {
     await client.query(`UPDATE "Order" SET "status" = 'REJECTED', "reason" = $2, "updatedAt" = now() WHERE "id" = $1`, [o.id, reason]);
+    if (violationType) {
+      await client.query(`INSERT INTO "Violation" ("accountId","type","action","detail") VALUES ($1,$2,'REJECT_ORDER',$3)`, [o.accountId, violationType, `${o.symbol} ${o.type.toLowerCase()}: ${reason}`]);
+    }
     await this.log(client, o.accountId, "ORDER_REJECTED", `${o.side} ${o.quantity} ${o.symbol} ${o.type.toLowerCase()} — ${reason}`);
   }
 
@@ -418,5 +429,11 @@ export class OrderEngine {
       type,
       message,
     ]);
+  }
+
+  /** Record a pre-trade rule rejection as a Violation + ORDER_REJECTED log (action = reject). */
+  private async recordViolation(client: PoolClient, accountId: string, type: string, detail: string) {
+    await client.query(`INSERT INTO "Violation" ("accountId","type","action","detail") VALUES ($1,$2,'REJECT_ORDER',$3)`, [accountId, type, detail]);
+    await this.log(client, accountId, "ORDER_REJECTED", detail);
   }
 }

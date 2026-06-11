@@ -48,10 +48,17 @@ export class AccountStream {
   private clients = new Map<WebSocket, ClientState>();
   private quotes = new Map<string, number>(); // symbol → latest price
   private accounts = new Map<string, CachedAccount>(); // accountId → cached data
+  private peaks = new Map<string, number>(); // accountId → trailing peak equity (for live drawdown)
   private timer: NodeJS.Timeout | null = null;
+  private risk: { evaluate(accountId: string, equity: number): Promise<void> } | null = null;
 
   constructor(provider: MarketDataProvider) {
     provider.on("quote", (q) => this.quotes.set(q.symbol, q.price));
+  }
+
+  /** Wire the risk engine (set after construction to avoid a circular dependency). */
+  setRiskEngine(risk: { evaluate(accountId: string, equity: number): Promise<void> }) {
+    this.risk = risk;
   }
 
   start() {
@@ -162,7 +169,33 @@ export class AccountStream {
   }
 
   private tick() {
+    // Evaluate each known account against its rule once per tick, using LIVE equity
+    // (cash + unrealized), and keep a trailing peak for live drawdown reporting.
+    for (const [accountId, acc] of this.accounts) {
+      const equity = acc.snapshot.balance + this.unrealizedFor(acc);
+      this.peaks.set(accountId, Math.max(this.peaks.get(accountId) ?? equity, equity));
+      if (this.risk) void this.risk.evaluate(accountId, equity).catch((e) => this.warnRisk(e));
+    }
     for (const [ws, st] of this.clients) this.pushAccount(ws, st);
+  }
+
+  private riskErrAt = 0;
+  /** Surface risk-evaluation failures (throttled) — e.g. the DB not being migrated. */
+  private warnRisk(err: unknown) {
+    const now = Date.now();
+    if (now - this.riskErrAt < 30_000) return;
+    this.riskErrAt = now;
+    console.error("[risk] evaluation error (did you run `npm run db:migrate`?):", (err as Error).message);
+  }
+
+  /** Sum unrealized P&L across an account's positions at the latest quotes. */
+  private unrealizedFor(acc: CachedAccount): number {
+    let u = 0;
+    for (const p of acc.positions) {
+      const mark = this.quotes.get(p.symbol) ?? p.markPrice ?? p.avgPrice;
+      u += (mark - p.avgPrice) * p.quantity * (p.side === "buy" ? 1 : -1);
+    }
+    return u;
   }
 
   /** Compute live PnL from cached positions + latest quotes and push to one client. */
@@ -196,13 +229,20 @@ export class AccountStream {
     }
 
     if (st.channels.has("account-updates")) {
+      const equity = acc.snapshot.balance + unrealized;
+      const peak = this.peaks.get(accountId) ?? equity;
       this.send(ws, {
         type: "account_update",
         channel: "account-updates",
+        status: acc.snapshot.status, // ACTIVE → PASSED/FAILED reflects live after a breach/target
         balance: round(acc.snapshot.balance, 2),
-        equity: round(acc.snapshot.balance + unrealized, 2),
+        equity: round(equity, 2),
         unrealizedPnl: round(unrealized, 2),
         realizedPnlToday: round(acc.snapshot.realizedPnlToday, 2),
+        // Equity-based day P&L (vs day-start equity) — exactly what the daily-loss limit checks.
+        dailyPnl: round(equity - acc.snapshot.dayStartEquity, 2),
+        totalPnl: round(equity - acc.snapshot.startingBalance, 2), // mark-to-market vs start
+        drawdown: round(Math.max(0, peak - equity), 2),
       });
     }
   }

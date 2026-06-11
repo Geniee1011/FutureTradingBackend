@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { BaseProvider, round } from "./provider.js";
 import { DatabentoClient } from "../databento/client.js";
 import { DbnDecoder, type DecodedBook, type DecodedRecord, type DecodedTrade } from "../databento/dbn.js";
-import { fetchDailyStats, fetchHistory } from "./databento-shared.js";
+import { aggregateCandles, fetchDailyStats, fetchHistory } from "./databento-shared.js";
 import { INSTRUMENTS, getInstrument } from "../instruments.js";
 import type { Candle } from "../types.js";
 
@@ -24,6 +24,11 @@ const MAX_BACKOFF_MS = 15_000;
 // Coalesce book updates: mbp-10 can tick many times per millisecond on liquid
 // contracts, but the UI only needs a fresh snapshot a few times per second.
 const BOOK_THROTTLE_MS = 150;
+// Rolling per-symbol live-bar buffer. The Historical API lags real-time (its
+// dataset-end trails by minutes/hours), so chart history stops short of "now".
+// We aggregate live trade prints into 1-minute bars and merge them into
+// getHistory, closing that seam — and the buffer survives frontend reloads.
+const LIVE_BAR_CAP = 1500; // ~25h of 1-minute bars per symbol
 
 interface SymState {
   price: number;
@@ -45,6 +50,7 @@ export class DatabentoLiveProvider extends BaseProvider {
   private state = new Map<string, SymState>();
   private idToSymbol = new Map<number, string>();
   private bookEmitAt = new Map<string, number>(); // per-symbol throttle clock
+  private liveBars = new Map<string, Candle[]>(); // 1-min bars built from live trades
   private streaming = false;
   private textBuf: Buffer = Buffer.alloc(0);
   private running = false;
@@ -53,6 +59,7 @@ export class DatabentoLiveProvider extends BaseProvider {
   private dailyTimer: NodeJS.Timeout | null = null;
   private failing = false;
   private lastErrorLogAt = 0;
+  private lastSocketError: string | null = null;
 
   constructor(
     private readonly apiKey: string,
@@ -89,7 +96,15 @@ export class DatabentoLiveProvider extends BaseProvider {
   async getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]> {
     const inst = getInstrument(symbol);
     if (!inst) return [];
-    return fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision);
+    const hist = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision);
+    // The live buffer is minute-grained, so it can only extend resolutions >= 1m.
+    const live = this.liveBars.get(symbol);
+    if (resolutionSec < 60 || !live || live.length === 0) return hist;
+    // Append live-built bars newer than the last Historical bar — this bridges
+    // the publication-delay seam between Historical and the live stream.
+    const lastHist = hist.length ? hist[hist.length - 1]!.time : 0;
+    const tail = aggregateCandles(live, resolutionSec).filter((c) => c.time > lastHist);
+    return tail.length ? [...hist, ...tail].slice(-count) : hist;
   }
 
   /** Resolve each root's current dated contract code (e.g. ES → ESM6). */
@@ -127,14 +142,18 @@ export class DatabentoLiveProvider extends BaseProvider {
     this.streaming = false;
     this.textBuf = Buffer.alloc(0);
     this.decoder.reset();
+    this.lastSocketError = null;
 
     const socket = net.connect(LIVE_PORT, this.host);
     this.socket = socket;
-    socket.on("connect", () => {
-      this.retries = 0;
-    });
+    // NB: don't reset backoff on TCP `connect`. A session that connects and
+    // authenticates but is dropped at/just-after subscription must still
+    // escalate — otherwise the loop hammers every 1000ms forever. retries
+    // resets only once a real DBN stream begins (see the `success=` branch).
     socket.on("data", (chunk) => this.onData(chunk));
-    socket.on("error", () => {}); // close handler schedules reconnect
+    socket.on("error", (err) => {
+      this.lastSocketError = (err as { message?: string }).message ?? "socket error";
+    });
     socket.on("close", () => {
       if (this.socket === socket) this.socket = null;
       if (this.running) this.scheduleReconnect();
@@ -144,7 +163,15 @@ export class DatabentoLiveProvider extends BaseProvider {
   private scheduleReconnect(): void {
     const delay = Math.min(BASE_BACKOFF_MS * 2 ** this.retries, MAX_BACKOFF_MS);
     this.retries += 1;
-    this.logError(new Error(`live disconnected — reconnecting in ${delay}ms`));
+    const reason = this.lastSocketError
+      ? `socket error: ${this.lastSocketError}`
+      : this.streaming
+        ? "gateway closed the stream (entitlement/idle?)"
+        : "closed during handshake";
+    // Reset the throttle so the disconnect reason is never swallowed, even in a
+    // tight reconnect loop. (HTTP poll errors in logError still throttle.)
+    this.failing = false;
+    this.logError(new Error(`live disconnected (${reason}) — reconnecting in ${delay}ms`));
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     this.reconnectTimer = setTimeout(() => this.connect(), delay);
   }
@@ -181,18 +208,31 @@ export class DatabentoLiveProvider extends BaseProvider {
       this.socket?.write(`schema=trades|stype_in=continuous|symbols=${symbols}\n`);
       // Real depth book: top-10 market-by-price. Each mbp-10 message is a full
       // top-10 snapshot, so no incremental book state has to be maintained.
-      this.socket?.write(`schema=mbp-10|stype_in=continuous|symbols=${symbols}\n`);
+      // NOTE: gated behind DATABENTO_MBP10 while we confirm whether this
+      // subscription is what the gateway is silently closing (entitlement?).
+      if (process.env.DATABENTO_MBP10 === "1") {
+        this.socket?.write(`schema=mbp-10|stype_in=continuous|symbols=${symbols}\n`);
+      }
       this.socket?.write(`start_session=0\n`);
       this.streaming = true;
       this.logRecovered();
       console.log("[live] authenticated — streaming trades + mbp-10 book for", INSTRUMENTS.length, "instruments");
     } else if (line.startsWith("error=")) {
-      this.logError(new Error(line));
+      // Unconditional — a subscription/entitlement rejection must never be
+      // swallowed by the error throttle.
+      console.warn(`[live] gateway error: ${line.trim()}`);
       this.socket?.destroy();
+    } else if (line.trim()) {
+      // Any other control line (warnings, rejects) — surface it raw to diagnose
+      // silent closes.
+      console.warn(`[live] gateway: ${line.trim()}`);
     }
   }
 
   private onRecord(r: DecodedRecord): void {
+    // Reset backoff only once real data flows — reaching `success=` isn't enough,
+    // since the gateway can ack then immediately close (see entitlement loop).
+    if (this.retries) this.retries = 0;
     if (r.kind === "trade") this.onTrade(r);
     else this.onBook(r);
   }
@@ -209,7 +249,32 @@ export class DatabentoLiveProvider extends BaseProvider {
       st.high = Math.max(st.high, t.price);
       st.low = Math.min(st.low, t.price);
     }
-    this.emitQuote(symbol, st);
+    this.recordLiveBar(symbol, t.price, t.size, t.ts);
+    this.emitQuote(symbol, st, t.size);
+  }
+
+  /** Fold a trade print into the rolling 1-minute live-bar buffer for chart backfill. */
+  private recordLiveBar(symbol: string, price: number, size: number, tsMs: number): void {
+    if (!Number.isFinite(price) || tsMs <= 0) return;
+    const p = getInstrument(symbol)!.pricePrecision;
+    const px = round(price, p);
+    const bucket = Math.floor(tsMs / 60_000) * 60; // minute-aligned, epoch SECONDS
+    let bars = this.liveBars.get(symbol);
+    if (!bars) {
+      bars = [];
+      this.liveBars.set(symbol, bars);
+    }
+    const last = bars[bars.length - 1];
+    if (last && last.time === bucket) {
+      last.high = Math.max(last.high, px);
+      last.low = Math.min(last.low, px);
+      last.close = px;
+      last.volume += size;
+    } else if (!last || bucket > last.time) {
+      bars.push({ time: bucket, open: px, high: px, low: px, close: px, volume: size });
+      if (bars.length > LIVE_BAR_CAP) bars.shift();
+    }
+    // Out-of-order prints older than the current bucket are ignored for bar-building.
   }
 
   // --- 24h stats (Historical HTTP) ---------------------------------
@@ -244,7 +309,7 @@ export class DatabentoLiveProvider extends BaseProvider {
     );
   }
 
-  private emitQuote(symbol: string, st: SymState): void {
+  private emitQuote(symbol: string, st: SymState, lastSize = 0): void {
     const inst = getInstrument(symbol)!;
     const p = inst.pricePrecision;
     const spread = inst.tickSize;
@@ -257,6 +322,7 @@ export class DatabentoLiveProvider extends BaseProvider {
       high24h: round(st.haveStats ? Math.max(st.high, st.price) : st.price, p),
       low24h: round(st.haveStats ? Math.min(st.low, st.price) : st.price, p),
       volume24h: st.haveStats ? Math.round(st.volume) : 0,
+      lastSize, // per-trade size so the UI can build live-bar volume (0 on stats refresh)
       ts: st.priceTs || Date.now(),
     });
   }

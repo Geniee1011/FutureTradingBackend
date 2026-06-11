@@ -10,6 +10,7 @@ export interface Quote {
   high24h: number;
   low24h: number;
   volume24h: number;
+  lastSize?: number; // size of the trade that produced this tick (0 on stats-only refresh)
   ts: number; // epoch ms
 }
 

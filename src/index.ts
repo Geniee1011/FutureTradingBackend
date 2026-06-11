@@ -11,6 +11,7 @@ import { AuthService } from "./auth/service.js";
 import { createUserStore } from "./auth/store-factory.js";
 import { AccountStream } from "./realtime/account-stream.js";
 import { OrderEngine } from "./trading/order-engine.js";
+import { RiskEngine } from "./trading/risk-engine.js";
 
 function buildProvider(): MarketDataProvider {
   if (useDatabento && config.databento.live) {
@@ -40,6 +41,11 @@ accountStream.start();
 // and runs the resting-order monitor that triggers limit/stop orders.
 const orderEngine = new OrderEngine(accountStream);
 orderEngine.start();
+
+// Risk/evaluation engine — enforces daily-loss / drawdown / profit-target rules.
+// Driven by the AccountStream tick on live equity; liquidates + fails or passes.
+const riskEngine = new RiskEngine(orderEngine, accountStream);
+accountStream.setRiskEngine(riskEngine);
 
 // Contract codes (root → e.g. ESM6). Seed with a date-based approximation so the
 // endpoint is never empty; override with Databento-accurate codes when available.

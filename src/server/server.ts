@@ -16,6 +16,18 @@ import {
 } from "../trading/repository.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 import type { OrderEngine, PlaceOrderInput } from "../trading/order-engine.js";
+import {
+  adminListAccounts,
+  adminListActivity,
+  adminListRules,
+  adminListTraders,
+  adminSetAccountStatus,
+  adminSetTraderStatus,
+  adminUpdateRule,
+  logActivity,
+  type AdminAction,
+} from "../trading/admin-repository.js";
+import { getPool } from "../db/pool.js";
 
 interface ServerOptions {
   port: number;
@@ -130,6 +142,18 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
     return void handleEquityCurve(req, res);
   }
 
+  // --- Admin (ADMIN role only) ---
+  if (url.pathname === "/api/admin/traders" && req.method === "GET") return void handleAdmin(req, res, adminListTraders);
+  if (url.pathname === "/api/admin/accounts" && req.method === "GET") return void handleAdmin(req, res, adminListAccounts);
+  if (url.pathname === "/api/admin/activity" && req.method === "GET") return void handleAdmin(req, res, () => adminListActivity(200));
+  if (url.pathname === "/api/admin/rules" && req.method === "GET") return void handleAdmin(req, res, adminListRules);
+  if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
+    return void handleAdminStatus(url, req, res, opts.accountStream, "trader");
+  if (/^\/api\/admin\/accounts\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
+    return void handleAdminStatus(url, req, res, opts.accountStream, "account");
+  if (/^\/api\/admin\/rules\/[^/]+$/.test(url.pathname) && req.method === "POST")
+    return void handleAdminRuleUpdate(url, req, res);
+
   if (url.pathname === "/health") {
     return json(res, 200, {
       status: "ok",
@@ -187,7 +211,62 @@ async function handleLogin(req: IncomingMessage, res: ServerResponse, auth: Auth
   if (!body?.email || !body?.password) return json(res, 400, { error: "email and password required" });
   const result = await auth.login(body.email, body.password);
   if (!result) return json(res, 401, { error: "Invalid email or password." });
+  // Audit the login (best-effort; never blocks auth).
+  if (useDatabase) {
+    void (async () => {
+      try {
+        const accountId = await getAccountIdByUserId(result.user.id);
+        if (accountId) await logActivity(getPool(), accountId, "USER_LOGIN", "Signed in", clientIp(req));
+      } catch {
+        /* ignore audit failures */
+      }
+    })();
+  }
   json(res, 200, result);
+}
+
+/** Best-effort client IP for audit logs. */
+function clientIp(req: IncomingMessage): string | undefined {
+  const fwd = req.headers["x-forwarded-for"];
+  if (typeof fwd === "string" && fwd) return fwd.split(",")[0]!.trim();
+  return req.socket.remoteAddress ?? undefined;
+}
+
+/** True only for a valid ADMIN-role bearer token. */
+function requireAdmin(req: IncomingMessage): boolean {
+  if (!useDatabase) return false;
+  const payload = verifyToken(bearerToken(req.headers.authorization) ?? "");
+  return !!payload && payload.role === "ADMIN";
+}
+
+async function handleAdmin(req: IncomingMessage, res: ServerResponse, load: () => Promise<unknown>) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  try {
+    json(res, 200, await load());
+  } catch (err) {
+    console.error("[admin] query failed:", (err as Error).message);
+    json(res, 500, { error: "admin query failed" });
+  }
+}
+
+async function handleAdminStatus(url: URL, req: IncomingMessage, res: ServerResponse, accountStream: AccountStream, kind: "trader" | "account") {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const id = url.pathname.split("/")[4]!; // /api/admin/{traders|accounts}/:id/status
+  const body = await readJson<{ status?: string }>(req);
+  const action: AdminAction | null = body?.status === "suspended" ? "suspended" : body?.status === "active" ? "active" : null;
+  if (!action) return json(res, 400, { error: "status must be 'active' or 'suspended'" });
+  const ok = kind === "trader" ? await adminSetTraderStatus(id, action) : await adminSetAccountStatus(id, action);
+  if (ok) accountStream.publishAdminUpdate({ kind: `${kind}_${action}`, id }); // live-refresh admin dashboards
+  json(res, ok ? 200 : 404, { ok, error: ok ? undefined : "not found or no change" });
+}
+
+async function handleAdminRuleUpdate(url: URL, req: IncomingMessage, res: ServerResponse) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const accountId = url.pathname.split("/")[4]!; // /api/admin/rules/:accountId
+  const body = await readJson<{ maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number }>(req);
+  if (!body) return json(res, 400, { error: "body required" });
+  const ok = await adminUpdateRule(accountId, body);
+  json(res, ok ? 200 : 400, { ok, error: ok ? undefined : "no valid fields to update" });
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

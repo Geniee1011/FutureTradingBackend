@@ -191,8 +191,19 @@ export class DatabentoClient {
     stypeOut: string,
     dateMs: number,
   ): Promise<Record<string, string>> {
-    const date = new Date(dateMs).toISOString().slice(0, 10);
-    const next = new Date(dateMs + 86_400_000).toISOString().slice(0, 10);
+    // Databento rejects symbology windows whose start_date is on/after the
+    // dataset's available end (case: data_start_date_after_available_end_date).
+    // "Now" becomes exactly that edge the moment the clock ticks into the
+    // dataset's end day, so step the lookup back to the last available day.
+    let capMs = dateMs - 86_400_000; // fallback: yesterday
+    try {
+      capMs = (await this.availableEnd("trades")) - 86_400_000;
+    } catch {
+      /* keep the yesterday fallback */
+    }
+    const baseMs = Math.min(dateMs, capMs);
+    const date = new Date(baseMs).toISOString().slice(0, 10);
+    const next = new Date(baseMs + 86_400_000).toISOString().slice(0, 10);
     const qs = new URLSearchParams({
       dataset: this.dataset,
       symbols: symbols.join(","),
@@ -204,7 +215,12 @@ export class DatabentoClient {
     const res = await fetchWithRetry(`${HIST_BASE}/symbology.resolve?${qs.toString()}`, {
       headers: { Authorization: this.authHeader() },
     });
-    if (!res.ok) throw new Error(`Databento symbology ${res.status}`);
+    if (!res.ok) {
+      // Surface the body + the requested window — a 422 here is almost always a
+      // date/symbol-range rejection (e.g. end_date past the dataset's edge).
+      const body = await res.text().catch(() => "");
+      throw new Error(`Databento symbology ${res.status} [${date}..${next}]: ${body.slice(0, 200)}`);
+    }
     const body = (await res.json()) as { result?: Record<string, { s: string }[]> };
     const out: Record<string, string> = {};
     for (const [key, arr] of Object.entries(body.result ?? {})) {

@@ -1,3 +1,4 @@
+import { HISTORY_RETRIES, HISTORY_TIMEOUT_MS } from "../databento/client.js";
 import type { DatabentoClient, OhlcvRecord } from "../databento/client.js";
 import { round } from "./provider.js";
 import type { Candle } from "../types.js";
@@ -29,12 +30,15 @@ export async function fetchHistory(
 ): Promise<Candle[]> {
   const startMs = Date.now() - count * resolutionSec * 1000 - GAP_PAD_MS;
   const native = NATIVE_SCHEMA[resolutionSec];
+  // Heavy historical fetches need the longer budget — the default 10s/1-retry
+  // isn't enough for Databento's cold-start latency (was silently timing out).
+  const histOpts = { retries: HISTORY_RETRIES, timeoutMs: HISTORY_TIMEOUT_MS };
   if (native) {
-    const bars = await client.ohlcv(dbSymbol, native, startMs, Date.now());
+    const bars = await client.ohlcv(dbSymbol, native, startMs, Date.now(), undefined, histOpts);
     return bars.slice(-count).map((b) => toCandle(b, precision));
   }
   // Aggregate 1-minute bars for non-native resolutions (e.g. 5m, 15m).
-  const minutes = await client.ohlcv(dbSymbol, "ohlcv-1m", startMs, Date.now());
+  const minutes = await client.ohlcv(dbSymbol, "ohlcv-1m", startMs, Date.now(), undefined, histOpts);
   return aggregate(minutes, resolutionSec, precision).slice(-count);
 }
 
@@ -53,7 +57,10 @@ export interface DailyStats {
  * 24 *trading* hours (the last session) instead of an empty window.
  */
 export async function fetchDailyStats(client: DatabentoClient, dbSymbol: string): Promise<DailyStats | null> {
-  const bars = await client.ohlcv(dbSymbol, "ohlcv-1h", Date.now() - 5 * 24 * 3600_000, Date.now());
+  const bars = await client.ohlcv(dbSymbol, "ohlcv-1h", Date.now() - 5 * 24 * 3600_000, Date.now(), undefined, {
+    retries: HISTORY_RETRIES,
+    timeoutMs: HISTORY_TIMEOUT_MS,
+  });
   const window = bars.slice(-24);
   if (window.length === 0) return null;
   return {
@@ -63,6 +70,29 @@ export async function fetchDailyStats(client: DatabentoClient, dbSymbol: string)
     volume: window.reduce((acc, b) => acc + b.volume, 0),
     close: window.at(-1)!.close,
   };
+}
+
+/**
+ * Aggregate minute-grained candles (e.g. a live trade-built buffer) into
+ * `resolutionSec` buckets. Identity for resolutions <= 60s. Used to merge the
+ * live provider's rolling 1-minute bars into a higher-resolution history series.
+ */
+export function aggregateCandles(oneMin: Candle[], resolutionSec: number): Candle[] {
+  if (resolutionSec <= 60) return oneMin.slice();
+  const buckets = new Map<number, Candle>();
+  for (const m of oneMin) {
+    const bucket = m.time - (m.time % resolutionSec);
+    const ex = buckets.get(bucket);
+    if (!ex) {
+      buckets.set(bucket, { ...m, time: bucket });
+    } else {
+      ex.high = Math.max(ex.high, m.high);
+      ex.low = Math.min(ex.low, m.low);
+      ex.close = m.close;
+      ex.volume += m.volume;
+    }
+  }
+  return [...buckets.values()].sort((a, b) => a.time - b.time);
 }
 
 function toCandle(b: OhlcvRecord, p: number): Candle {

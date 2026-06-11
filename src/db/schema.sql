@@ -44,6 +44,10 @@ CREATE TABLE IF NOT EXISTS "Account" (
   "updatedAt"       timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS "Account_status_idx" ON "Account" ("status");
+-- Daily-loss anchor: equity at the start of the current trading day (UTC), and
+-- the date it belongs to. The risk engine rolls these at the date boundary.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "dayStartEquity" numeric(18,2);
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "dayStartAt"     date;
 
 CREATE TABLE IF NOT EXISTS "Rule" (
   "id"                 text PRIMARY KEY DEFAULT gen_random_uuid()::text,

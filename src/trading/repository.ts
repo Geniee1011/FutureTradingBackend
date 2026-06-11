@@ -14,8 +14,8 @@ export async function createEvaluationAccount(userId: string): Promise<void> {
   try {
     await client.query("BEGIN");
     const acc = await client.query<{ id: string }>(
-      `INSERT INTO "Account" ("userId","startingBalance","balance","equity","highestEquity","status")
-       VALUES ($1,$2,$2,$2,$2,'ACTIVE')
+      `INSERT INTO "Account" ("userId","startingBalance","balance","equity","highestEquity","dayStartEquity","dayStartAt","status")
+       VALUES ($1,$2,$2,$2,$2,$2,CURRENT_DATE,'ACTIVE')
        ON CONFLICT ("userId") DO NOTHING
        RETURNING "id"`,
       [userId, STARTING_BALANCE],
@@ -61,6 +61,7 @@ export interface ApiAccount {
   equity: number;
   unrealizedPnl: number;
   realizedPnlToday: number;
+  dailyPnl: number; // equity-based day P&L (vs day-start equity) — matches the enforced daily-loss limit
   totalPnl: number;
   drawdown: number;
   highestEquity: number;
@@ -71,7 +72,7 @@ export interface ApiAccount {
 export async function getAccountDetail(accountId: string): Promise<ApiAccount | null> {
   const { rows } = await getPool().query(
     `SELECT a."id", a."status", a."startingBalance", a."balance", a."equity",
-            a."totalPnl", a."dailyPnl", a."drawdown", a."highestEquity",
+            a."totalPnl", a."dailyPnl", a."drawdown", a."highestEquity", a."dayStartEquity",
             r."profitTarget", r."maxDailyLoss", r."maxDrawdown", r."maxContracts"
      FROM "Account" a
      LEFT JOIN "Rule" r ON r."accountId" = a."id"
@@ -89,6 +90,8 @@ export async function getAccountDetail(accountId: string): Promise<ApiAccount | 
     equity: Number(r.equity),
     unrealizedPnl: 0, // overlaid live by the WS account-updates channel
     realizedPnlToday: Number(r.dailyPnl),
+    // equity-based day P&L vs the day's starting equity — the figure the daily-loss limit uses.
+    dailyPnl: Number(r.equity) - (r.dayStartEquity != null ? Number(r.dayStartEquity) : Number(r.startingBalance)),
     totalPnl: Number(r.totalPnl),
     drawdown: Number(r.drawdown),
     highestEquity: Number(r.highestEquity),
@@ -151,11 +154,13 @@ export interface AccountSnapshot {
   balance: number;
   startingBalance: number;
   realizedPnlToday: number;
+  status: string;
+  dayStartEquity: number; // equity at the start of the current trading day
 }
 
 export async function getAccountSnapshot(accountId: string): Promise<AccountSnapshot | null> {
   const { rows } = await getPool().query(
-    `SELECT "balance","startingBalance","dailyPnl" FROM "Account" WHERE "id" = $1`,
+    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity" FROM "Account" WHERE "id" = $1`,
     [accountId],
   );
   const r = rows[0];
@@ -164,6 +169,8 @@ export async function getAccountSnapshot(accountId: string): Promise<AccountSnap
     balance: Number(r.balance),
     startingBalance: Number(r.startingBalance),
     realizedPnlToday: Number(r.dailyPnl),
+    status: r.status,
+    dayStartEquity: r.dayStartEquity != null ? Number(r.dayStartEquity) : Number(r.startingBalance),
   };
 }
 
