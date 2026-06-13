@@ -1,7 +1,8 @@
+import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { getPool } from "../db/pool.js";
 import { useDatabase } from "../config.js";
-import { getInstrument } from "../instruments.js";
+import { getInstrument, getMultiplier } from "../instruments.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 
 /* ------------------------------------------------------------------ *
@@ -22,6 +23,9 @@ export interface PlaceOrderInput {
   type: ApiOrderType;
   quantity: number;
   price?: number | null;
+  /** Optional bracket: on entry fill, place an opposing stop (SL) / limit (TP), OCO-linked. */
+  stopLoss?: number | null;
+  takeProfit?: number | null;
 }
 
 export interface PlaceResult {
@@ -48,6 +52,9 @@ interface WorkingOrder {
   type: "LIMIT" | "STOP";
   quantity: number;
   requestedPrice: number;
+  slPrice: number | null; // set on a bracket ENTRY order (creates exit legs on fill)
+  tpPrice: number | null;
+  ocoGroupId: string | null; // set on a bracket EXIT leg (one filling cancels its sibling)
 }
 
 // How often the resting-order monitor scans for triggers.
@@ -109,12 +116,22 @@ export class OrderEngine {
       const isMarket = input.type === "market";
       const fillPrice = isMarket ? mark! : (input.price as number);
 
-      // Limit/stop → store as a working order; no fill yet.
+      // Validate the bracket (SL/TP) against the entry reference price.
+      const slPrice = input.stopLoss != null ? Number(input.stopLoss) : null;
+      const tpPrice = input.takeProfit != null ? Number(input.takeProfit) : null;
+      const bErr = bracketError(input.side, fillPrice, slPrice, tpPrice);
+      if (bErr) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: bErr };
+      }
+
+      // Limit/stop → store as a working order; no fill yet. SL/TP ride along and
+      // become exit legs when the entry fills (see fillWorkingOrder).
       if (!isMarket) {
         const ord = await client.query<{ id: string }>(
-          `INSERT INTO "Order" ("accountId","symbol","side","type","quantity","requestedPrice","status")
-           VALUES ($1,$2,$3,$4,$5,$6,'PENDING') RETURNING "id"`,
-          [accountId, input.symbol, input.side.toUpperCase(), input.type.toUpperCase(), input.quantity, input.price],
+          `INSERT INTO "Order" ("accountId","symbol","side","type","quantity","requestedPrice","status","slPrice","tpPrice")
+           VALUES ($1,$2,$3,$4,$5,$6,'PENDING',$7,$8) RETURNING "id"`,
+          [accountId, input.symbol, input.side.toUpperCase(), input.type.toUpperCase(), input.quantity, input.price, slPrice, tpPrice],
         );
         await this.log(client, accountId, "ORDER_PLACEMENT", `${input.side} ${input.quantity} ${input.symbol} ${input.type} @ ${input.price}`);
         await client.query("COMMIT");
@@ -145,6 +162,11 @@ export class OrderEngine {
       );
       await this.log(client, accountId, "ORDER_FILLED", `${input.side} ${input.quantity} ${input.symbol} @ ${fillPrice}`);
 
+      // Attach the bracket: opposing stop (SL) + limit (TP), OCO-linked.
+      if (slPrice != null || tpPrice != null) {
+        await this.createBracketChildren(client, accountId, input.symbol, input.side, input.quantity, slPrice, tpPrice);
+      }
+
       await client.query("COMMIT");
 
       // Refresh the live bridge cache so position/account updates reflect the trade.
@@ -170,7 +192,80 @@ export class OrderEngine {
     const pos = rows[0];
     if (!pos) return { ok: false, error: "No open position to close." };
     const side: ApiSide = pos.side === "LONG" ? "sell" : "buy";
-    return this.place(accountId, { symbol, side, type: "market", quantity: Number(pos.quantity) });
+    const result = await this.place(accountId, { symbol, side, type: "market", quantity: Number(pos.quantity) });
+    // Flat now → any resting SL/TP legs for this symbol are moot; cancel them.
+    if (result.ok) await this.cancelBracketsForSymbol(accountId, symbol);
+    return result;
+  }
+
+  /** Cancel any resting bracket (SL/TP) legs for an account's symbol. */
+  private async cancelBracketsForSymbol(accountId: string, symbol: string): Promise<void> {
+    const res = await getPool()
+      .query(
+        `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'position closed', "updatedAt" = now()
+         WHERE "accountId" = $1 AND "symbol" = $2 AND "status" = 'PENDING' AND "ocoGroupId" IS NOT NULL`,
+        [accountId, symbol],
+      )
+      .catch(() => null);
+    if (res?.rowCount) this.accountStream.publishOrderUpdate(accountId, { symbol, status: "cancelled" });
+  }
+
+  /** Create the opposing stop (SL) + limit (TP) exit legs for a just-opened position. */
+  private async createBracketChildren(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    entrySide: ApiSide,
+    qty: number,
+    slPrice: number | null,
+    tpPrice: number | null,
+  ): Promise<void> {
+    // One bracket per symbol — clear any existing resting legs first.
+    await client.query(
+      `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'replaced by new bracket', "updatedAt" = now()
+       WHERE "accountId" = $1 AND "symbol" = $2 AND "status" = 'PENDING' AND "ocoGroupId" IS NOT NULL`,
+      [accountId, symbol],
+    );
+    const exitSide = entrySide === "buy" ? "SELL" : "BUY";
+    const group = randomUUID();
+    if (slPrice != null) {
+      await client.query(
+        `INSERT INTO "Order" ("accountId","symbol","side","type","quantity","requestedPrice","stopPrice","status","ocoGroupId")
+         VALUES ($1,$2,$3,'STOP',$4,$5,$5,'PENDING',$6)`,
+        [accountId, symbol, exitSide, qty, slPrice, group],
+      );
+    }
+    if (tpPrice != null) {
+      await client.query(
+        `INSERT INTO "Order" ("accountId","symbol","side","type","quantity","requestedPrice","status","ocoGroupId")
+         VALUES ($1,$2,$3,'LIMIT',$4,$5,'PENDING',$6)`,
+        [accountId, symbol, exitSide, qty, tpPrice, group],
+      );
+    }
+    const legs = [slPrice != null ? `SL ${slPrice}` : null, tpPrice != null ? `TP ${tpPrice}` : null].filter(Boolean).join(" · ");
+    await this.log(client, accountId, "ORDER_PLACEMENT", `bracket ${exitSide.toLowerCase()} ${qty} ${symbol} (${legs})`);
+  }
+
+  /** Admin: flatten every open position at market. Returns how many were closed. */
+  async closeAllPositions(accountId: string): Promise<number> {
+    const { rows } = await getPool().query<{ symbol: string }>(`SELECT "symbol" FROM "Position" WHERE "accountId" = $1`, [accountId]);
+    let closed = 0;
+    for (const r of rows) {
+      const res = await this.closePosition(accountId, r.symbol).catch(() => ({ ok: false as const }));
+      if (res.ok) closed += 1;
+    }
+    return closed;
+  }
+
+  /** Admin: cancel every working (PENDING) order. Returns how many were cancelled. */
+  async cancelAllOrders(accountId: string): Promise<number> {
+    const { rows } = await getPool().query<{ id: string }>(`SELECT "id" FROM "Order" WHERE "accountId" = $1 AND "status" = 'PENDING'`, [accountId]);
+    let cancelled = 0;
+    for (const r of rows) {
+      const res = await this.cancel(accountId, r.id).catch(() => ({ ok: false as const }));
+      if (res.ok) cancelled += 1;
+    }
+    return cancelled;
   }
 
   /** Cancel a working (PENDING) limit/stop order owned by this account. */
@@ -264,9 +359,11 @@ export class OrderEngine {
       return 0;
     }
 
-    // Opposing order: reduce, close, or flip.
+    // Opposing order: reduce, close, or flip. Realized P&L is in DOLLARS, so it
+    // includes the contract point value (ES=$50/pt, NQ=$20/pt, …) and rounds to
+    // cents — not price precision (which is 0 dp for YM/MYM and would drop cents).
     const closedQty = Math.min(qty, existing.quantity);
-    const realized = round((fillPrice - existing.averagePrice) * closedQty * dir);
+    const realized = Math.round((fillPrice - existing.averagePrice) * closedQty * dir * getMultiplier(symbol) * 100) / 100;
 
     if (qty < existing.quantity) {
       await client.query(`UPDATE "Position" SET "quantity" = $2, "realizedPnl" = "realizedPnl" + $3, "updatedAt" = now() WHERE "id" = $1`, [
@@ -324,7 +421,7 @@ export class OrderEngine {
     this.scanning = true;
     try {
       const { rows } = await getPool().query<WorkingOrder>(
-        `SELECT "id","accountId","symbol","side","type","quantity","requestedPrice"
+        `SELECT "id","accountId","symbol","side","type","quantity","requestedPrice","slPrice","tpPrice","ocoGroupId"
          FROM "Order" WHERE "status" = 'PENDING' AND "type" IN ('LIMIT','STOP')`,
       );
       for (const o of rows) {
@@ -403,6 +500,22 @@ export class OrderEngine {
       );
       await this.settleFill(client, o.accountId, o.id, o.symbol, side, qty, fillPrice, inst.pricePrecision);
       await this.log(client, o.accountId, "ORDER_FILLED", `${side} ${qty} ${o.symbol} @ ${fillPrice} (${o.type.toLowerCase()})`);
+
+      // OCO: this leg filled → cancel its sibling. (A bracket exit leg has an ocoGroupId.)
+      if (o.ocoGroupId) {
+        await client.query(
+          `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'OCO: sibling filled', "updatedAt" = now()
+           WHERE "ocoGroupId" = $1 AND "id" <> $2 AND "status" = 'PENDING'`,
+          [o.ocoGroupId, o.id],
+        );
+      }
+      // A bracket ENTRY (limit/stop with SL/TP) just filled → spawn its exit legs.
+      const slPrice = o.slPrice != null ? Number(o.slPrice) : null;
+      const tpPrice = o.tpPrice != null ? Number(o.tpPrice) : null;
+      if (slPrice != null || tpPrice != null) {
+        await this.createBracketChildren(client, o.accountId, o.symbol, side, qty, slPrice, tpPrice);
+      }
+
       await client.query("COMMIT");
 
       await this.accountStream.refreshAccount(o.accountId);
@@ -436,4 +549,22 @@ export class OrderEngine {
     await client.query(`INSERT INTO "Violation" ("accountId","type","action","detail") VALUES ($1,$2,'REJECT_ORDER',$3)`, [accountId, type, detail]);
     await this.log(client, accountId, "ORDER_REJECTED", detail);
   }
+}
+
+/**
+ * Validate a bracket against the entry side/price. A protective stop sits adverse
+ * to the entry and the target favourable: BUY → SL below / TP above; SELL → the
+ * reverse. Returns an error string, or null if the bracket is valid (or absent).
+ */
+function bracketError(side: ApiSide, ref: number, sl: number | null, tp: number | null): string | null {
+  const buy = side === "buy";
+  if (sl != null) {
+    if (!(sl > 0)) return "Stop loss must be a positive price.";
+    if (buy ? sl >= ref : sl <= ref) return `Stop loss must be ${buy ? "below" : "above"} the entry price.`;
+  }
+  if (tp != null) {
+    if (!(tp > 0)) return "Take profit must be a positive price.";
+    if (buy ? tp <= ref : tp >= ref) return `Take profit must be ${buy ? "above" : "below"} the entry price.`;
+  }
+  return null;
 }

@@ -13,14 +13,19 @@ import {
   listOrders,
   listPositions,
   listTransactions,
+  listViolations,
 } from "../trading/repository.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 import type { OrderEngine, PlaceOrderInput } from "../trading/order-engine.js";
 import {
+  adminAdjustBalance,
+  adminGetTraderDetail,
   adminListAccounts,
   adminListActivity,
   adminListRules,
   adminListTraders,
+  adminListViolations,
+  adminResetAccount,
   adminSetAccountStatus,
   adminSetTraderStatus,
   adminUpdateRule,
@@ -138,19 +143,27 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/transactions" && req.method === "GET") {
     return void handleTransactions(req, res);
   }
+  if (url.pathname === "/api/violations" && req.method === "GET") {
+    return void handleViolations(req, res);
+  }
   if (url.pathname === "/api/equity-curve" && req.method === "GET") {
     return void handleEquityCurve(req, res);
   }
 
   // --- Admin (ADMIN role only) ---
   if (url.pathname === "/api/admin/traders" && req.method === "GET") return void handleAdmin(req, res, adminListTraders);
+  if (/^\/api\/admin\/traders\/[^/]+$/.test(url.pathname) && req.method === "GET")
+    return void handleAdmin(req, res, () => adminGetTraderDetail(url.pathname.split("/")[4]!));
   if (url.pathname === "/api/admin/accounts" && req.method === "GET") return void handleAdmin(req, res, adminListAccounts);
   if (url.pathname === "/api/admin/activity" && req.method === "GET") return void handleAdmin(req, res, () => adminListActivity(200));
+  if (url.pathname === "/api/admin/violations" && req.method === "GET") return void handleAdmin(req, res, () => adminListViolations(200));
   if (url.pathname === "/api/admin/rules" && req.method === "GET") return void handleAdmin(req, res, adminListRules);
   if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return void handleAdminStatus(url, req, res, opts.accountStream, "trader");
   if (/^\/api\/admin\/accounts\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return void handleAdminStatus(url, req, res, opts.accountStream, "account");
+  if (/^\/api\/admin\/accounts\/[^/]+\/(reset|adjust-balance|close-all|liquidate|cancel-orders)$/.test(url.pathname) && req.method === "POST")
+    return void handleAdminAccountAction(url, req, res, opts.orderEngine, opts.accountStream);
   if (/^\/api\/admin\/rules\/[^/]+$/.test(url.pathname) && req.method === "POST")
     return void handleAdminRuleUpdate(url, req, res);
 
@@ -260,10 +273,57 @@ async function handleAdminStatus(url: URL, req: IncomingMessage, res: ServerResp
   json(res, ok ? 200 : 404, { ok, error: ok ? undefined : "not found or no change" });
 }
 
+async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: ServerResponse, orderEngine: OrderEngine, accountStream: AccountStream) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const parts = url.pathname.split("/");
+  const accountId = parts[4]!; // /api/admin/accounts/:id/:action
+  const action = parts[5]!;
+  try {
+    let result: Record<string, unknown> = { ok: true };
+    switch (action) {
+      case "reset": {
+        const ok = await adminResetAccount(accountId);
+        if (!ok) return json(res, 404, { ok: false, error: "account not found" });
+        break;
+      }
+      case "adjust-balance": {
+        const body = await readJson<{ amount?: number }>(req);
+        const amount = Number(body?.amount);
+        if (!Number.isFinite(amount) || amount === 0) return json(res, 400, { error: "amount must be a non-zero number" });
+        const ok = await adminAdjustBalance(accountId, amount);
+        if (!ok) return json(res, 404, { ok: false, error: "account not found" });
+        result = { ok: true, amount };
+        break;
+      }
+      case "close-all":
+        result = { ok: true, closed: await orderEngine.closeAllPositions(accountId) };
+        break;
+      case "cancel-orders":
+        result = { ok: true, cancelled: await orderEngine.cancelAllOrders(accountId) };
+        break;
+      case "liquidate": {
+        // Flatten at market WHILE still ACTIVE (closes only fill on active accounts), then freeze.
+        const closed = await orderEngine.closeAllPositions(accountId);
+        await adminSetAccountStatus(accountId, "suspended");
+        result = { ok: true, closed };
+        break;
+      }
+      default:
+        return json(res, 400, { error: "unknown action" });
+    }
+    await accountStream.refreshAccount(accountId).catch(() => {});
+    accountStream.publishAdminUpdate({ kind: `account_${action}`, id: accountId });
+    json(res, 200, result);
+  } catch (err) {
+    console.error(`[admin] account action ${action} failed:`, (err as Error).message);
+    json(res, 500, { error: "action failed" });
+  }
+}
+
 async function handleAdminRuleUpdate(url: URL, req: IncomingMessage, res: ServerResponse) {
   if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
   const accountId = url.pathname.split("/")[4]!; // /api/admin/rules/:accountId
-  const body = await readJson<{ maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number }>(req);
+  const body = await readJson<{ maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number; allowedInstruments?: string[] }>(req);
   if (!body) return json(res, 400, { error: "body required" });
   const ok = await adminUpdateRule(accountId, body);
   json(res, ok ? 200 : 400, { ok, error: ok ? undefined : "no valid fields to update" });
@@ -346,6 +406,12 @@ async function handleEquityCurve(req: IncomingMessage, res: ServerResponse) {
   const accountId = await requireAccount(req);
   if (!accountId) return json(res, 401, { error: "unauthorized" });
   json(res, 200, await getEquityCurve(accountId));
+}
+
+async function handleViolations(req: IncomingMessage, res: ServerResponse) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  json(res, 200, await listViolations(accountId));
 }
 
 async function handlePlaceOrder(req: IncomingMessage, res: ServerResponse, engine: OrderEngine) {

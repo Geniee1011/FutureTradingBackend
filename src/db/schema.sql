@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS "Order" (
 );
 CREATE INDEX IF NOT EXISTS "Order_accountId_status_idx" ON "Order" ("accountId","status");
 CREATE INDEX IF NOT EXISTS "Order_symbol_status_idx" ON "Order" ("symbol","status");
+-- Bracket (SL/TP) support: an entry order carries its stop-loss/take-profit prices;
+-- the resulting exit legs share an ocoGroupId so one filling cancels the other (OCO).
+ALTER TABLE "Order" ADD COLUMN IF NOT EXISTS "slPrice"    numeric(18,4);
+ALTER TABLE "Order" ADD COLUMN IF NOT EXISTS "tpPrice"    numeric(18,4);
+ALTER TABLE "Order" ADD COLUMN IF NOT EXISTS "ocoGroupId" text;
+CREATE INDEX IF NOT EXISTS "Order_ocoGroupId_idx" ON "Order" ("ocoGroupId");
 
 CREATE TABLE IF NOT EXISTS "Fill" (
   "id"        text PRIMARY KEY DEFAULT gen_random_uuid()::text,

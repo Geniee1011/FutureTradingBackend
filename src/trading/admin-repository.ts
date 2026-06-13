@@ -57,6 +57,7 @@ export interface AdminRuleRow {
   maxDrawdown: number;
   profitTarget: number;
   maxContracts: number;
+  allowedInstruments: string[];
 }
 
 // --- derivations for fields the schema doesn't store ---
@@ -174,7 +175,7 @@ export async function adminListActivity(limit = 200): Promise<AdminActivity[]> {
 export async function adminListRules(): Promise<AdminRuleRow[]> {
   const { rows } = await getPool().query(
     `SELECT a."id" AS "accountId", u."name" AS "traderName", u."email",
-            r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."maxContracts"
+            r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."maxContracts", r."allowedInstruments"
      FROM "Account" a
      JOIN "User" u ON u."id" = a."userId"
      JOIN "Rule" r ON r."accountId" = a."id"
@@ -188,7 +189,237 @@ export async function adminListRules(): Promise<AdminRuleRow[]> {
     maxDrawdown: Number(r.maxDrawdown),
     profitTarget: Number(r.profitTarget),
     maxContracts: Number(r.maxContracts),
+    allowedInstruments: (r.allowedInstruments as string[] | null) ?? [],
   }));
+}
+
+export interface AdminViolationRow {
+  id: string;
+  ts: number;
+  traderId: string;
+  traderName: string;
+  accountId: string;
+  type: string;
+  action: string;
+  detail: string | null;
+}
+
+/** All rule violations across accounts (newest first) for the admin Violations view. */
+export async function adminListViolations(limit = 200): Promise<AdminViolationRow[]> {
+  const { rows } = await getPool().query(
+    `SELECT v."id", v."type", v."action", v."detail", v."createdAt", v."accountId",
+            u."id" AS "traderId", u."name", u."email"
+     FROM "Violation" v
+     JOIN "Account" a ON a."id" = v."accountId"
+     JOIN "User" u ON u."id" = a."userId"
+     ORDER BY v."createdAt" DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    ts: ms(r.createdAt),
+    traderId: r.traderId,
+    traderName: r.name ?? r.email,
+    accountId: r.accountId,
+    type: r.type,
+    action: r.action,
+    detail: r.detail ?? null,
+  }));
+}
+
+// --- single-trader detail (admin/traders/:id) ---
+
+export interface AdminTraderAccount {
+  id: string;
+  startingBalance: number;
+  balance: number;
+  equity: number;
+  dailyPnl: number;
+  totalPnl: number;
+  drawdown: number;
+  highestEquity: number;
+  status: string;
+  currency: string;
+  createdAt: number;
+}
+export interface AdminTraderRule {
+  maxDailyLoss: number;
+  maxDrawdown: number;
+  profitTarget: number;
+  maxContracts: number;
+}
+export interface AdminTraderPosition {
+  symbol: string;
+  side: "LONG" | "SHORT";
+  quantity: number;
+  averagePrice: number;
+  unrealizedPnl: number;
+  realizedPnl: number;
+}
+export interface AdminTraderOrder {
+  id: string;
+  symbol: string;
+  side: string;
+  type: string;
+  quantity: number;
+  filledQuantity: number;
+  requestedPrice: number | null;
+  fillPrice: number | null;
+  status: string;
+  reason: string | null;
+  createdAt: number;
+}
+export interface AdminTraderViolation {
+  id: string;
+  ts: number;
+  type: string;
+  action: string;
+  detail: string | null;
+}
+export interface AdminTraderDetail {
+  trader: AdminTrader;
+  account: AdminTraderAccount | null;
+  rule: AdminTraderRule | null;
+  positions: AdminTraderPosition[];
+  orders: AdminTraderOrder[];
+  violations: AdminTraderViolation[];
+  activity: AdminActivity[];
+}
+
+/** Full management view for one trader: profile, account, rule, positions, orders, violations, activity. */
+export async function adminGetTraderDetail(userId: string): Promise<AdminTraderDetail | null> {
+  const pool = getPool();
+  const { rows: base } = await pool.query(
+    `SELECT u."id", u."name", u."email", u."status" AS "userStatus", u."createdAt",
+            a."id" AS "accountId", a."startingBalance", a."balance", a."equity", a."dailyPnl",
+            a."totalPnl", a."drawdown", a."highestEquity", a."status" AS "accountStatus",
+            a."createdAt" AS "accountCreatedAt",
+            r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."maxContracts"
+     FROM "User" u
+     LEFT JOIN "Account" a ON a."userId" = u."id"
+     LEFT JOIN "Rule" r ON r."accountId" = a."id"
+     WHERE u."id" = $1 AND u."role" = 'TRADER'`,
+    [userId],
+  );
+  const b = base[0];
+  if (!b) return null;
+
+  const accountId = (b.accountId as string | null) ?? null;
+  const equity = b.equity != null ? Number(b.equity) : 0;
+  const drawdown = b.drawdown != null ? Number(b.drawdown) : 0;
+  const maxDd = b.maxDrawdown != null ? Number(b.maxDrawdown) : 0;
+
+  const trader: AdminTrader = {
+    id: b.id,
+    name: b.name ?? b.email,
+    email: b.email,
+    country: "—",
+    status: traderStatus(b.userStatus, b.accountStatus),
+    kyc: "verified",
+    tier: tierFor(equity),
+    accountsCount: accountId ? 1 : 0,
+    equity,
+    pnl30d: b.totalPnl != null ? Number(b.totalPnl) : 0,
+    riskScore: maxDd > 0 ? Math.max(0, Math.min(100, Math.round((drawdown / maxDd) * 100))) : 0,
+    lastActive: ms(b.createdAt),
+    createdAt: ms(b.createdAt),
+  };
+  const account: AdminTraderAccount | null = accountId
+    ? {
+        id: accountId,
+        startingBalance: Number(b.startingBalance),
+        balance: Number(b.balance),
+        equity,
+        dailyPnl: Number(b.dailyPnl),
+        totalPnl: Number(b.totalPnl),
+        drawdown,
+        highestEquity: Number(b.highestEquity),
+        status: b.accountStatus,
+        currency: "USD",
+        createdAt: ms(b.accountCreatedAt),
+      }
+    : null;
+  const rule: AdminTraderRule | null =
+    accountId && b.maxDailyLoss != null
+      ? {
+          maxDailyLoss: Number(b.maxDailyLoss),
+          maxDrawdown: Number(b.maxDrawdown),
+          profitTarget: Number(b.profitTarget),
+          maxContracts: Number(b.maxContracts),
+        }
+      : null;
+
+  if (!accountId) {
+    return { trader, account, rule, positions: [], orders: [], violations: [], activity: [] };
+  }
+
+  const [pos, ord, vio, act] = await Promise.all([
+    pool.query(
+      `SELECT "symbol","side","quantity","averagePrice","unrealizedPnl","realizedPnl"
+       FROM "Position" WHERE "accountId" = $1 ORDER BY "symbol"`,
+      [accountId],
+    ),
+    pool.query(
+      `SELECT "id","symbol","side","type","quantity","filledQuantity","requestedPrice","fillPrice","status","reason","createdAt"
+       FROM "Order" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 50`,
+      [accountId],
+    ),
+    pool.query(
+      `SELECT "id","type","action","detail","createdAt" FROM "Violation" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 50`,
+      [accountId],
+    ),
+    pool.query(
+      `SELECT "id","type","message","ip","createdAt" FROM "ActivityLog" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 50`,
+      [accountId],
+    ),
+  ]);
+
+  trader.lastActive = act.rows[0] ? ms(act.rows[0].createdAt) : ms(b.createdAt);
+
+  return {
+    trader,
+    account,
+    rule,
+    positions: pos.rows.map((p) => ({
+      symbol: p.symbol,
+      side: p.side,
+      quantity: p.quantity,
+      averagePrice: Number(p.averagePrice),
+      unrealizedPnl: Number(p.unrealizedPnl),
+      realizedPnl: Number(p.realizedPnl),
+    })),
+    orders: ord.rows.map((o) => ({
+      id: o.id,
+      symbol: o.symbol,
+      side: o.side,
+      type: o.type,
+      quantity: o.quantity,
+      filledQuantity: o.filledQuantity,
+      requestedPrice: o.requestedPrice != null ? Number(o.requestedPrice) : null,
+      fillPrice: o.fillPrice != null ? Number(o.fillPrice) : null,
+      status: o.status,
+      reason: o.reason ?? null,
+      createdAt: ms(o.createdAt),
+    })),
+    violations: vio.rows.map((v) => ({
+      id: v.id,
+      ts: ms(v.createdAt),
+      type: v.type,
+      action: v.action,
+      detail: v.detail ?? null,
+    })),
+    activity: act.rows.map((r) => ({
+      id: r.id,
+      ts: ms(r.createdAt),
+      actor: trader.name,
+      action: ACTION_LABEL[r.type] ?? String(r.type).toLowerCase().replace(/_/g, " "),
+      target: r.message ?? "",
+      severity: SEVERITY[r.type] ?? "info",
+      ip: r.ip ?? undefined,
+      detail: r.message ?? undefined,
+    })),
+  };
 }
 
 // --------------------------- mutations ---------------------------
@@ -249,21 +480,89 @@ export async function adminSetAccountStatus(accountId: string, action: AdminActi
   }
 }
 
-/** Update an account's evaluation limits (picked up live by the risk engine). */
+/** Update an account's evaluation limits + allowed instruments (picked up live by the risk engine). */
 export async function adminUpdateRule(
   accountId: string,
-  fields: { maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number },
+  fields: { maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number; allowedInstruments?: string[] },
 ): Promise<boolean> {
   const cols: string[] = [];
   const vals: unknown[] = [accountId];
-  for (const [k, v] of Object.entries(fields)) {
+  for (const k of ["maxDailyLoss", "maxDrawdown", "profitTarget", "maxContracts"] as const) {
+    const v = fields[k];
     if (v == null || !Number.isFinite(Number(v)) || Number(v) < 0) continue;
     cols.push(`"${k}" = $${vals.length + 1}`);
     vals.push(Number(v));
   }
+  if (Array.isArray(fields.allowedInstruments)) {
+    const list = fields.allowedInstruments.filter((s) => typeof s === "string");
+    cols.push(`"allowedInstruments" = $${vals.length + 1}`);
+    vals.push(list);
+  }
   if (cols.length === 0) return false;
   const res = await getPool().query(`UPDATE "Rule" SET ${cols.join(", ")}, "updatedAt" = now() WHERE "accountId" = $1`, vals);
   return (res.rowCount ?? 0) > 0;
+}
+
+/** Reset an evaluation account to its day-1 state: wipe positions/orders/violations,
+ *  reset the ledger to a single opening deposit, and restore balance/status. */
+export async function adminResetAccount(accountId: string): Promise<boolean> {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const acc = await client.query<{ startingBalance: string }>(
+      `SELECT "startingBalance" FROM "Account" WHERE "id" = $1 FOR UPDATE`,
+      [accountId],
+    );
+    const sb = acc.rows[0]?.startingBalance;
+    if (sb == null) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    await client.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
+    await client.query(`DELETE FROM "Order" WHERE "accountId" = $1`, [accountId]); // Fills cascade
+    await client.query(`DELETE FROM "Violation" WHERE "accountId" = $1`, [accountId]);
+    await client.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
+    await client.query(`INSERT INTO "Transaction" ("accountId","type","amount","description") VALUES ($1,'DEPOSIT',$2,'Account reset — opening balance')`, [accountId, sb]);
+    await client.query(
+      `UPDATE "Account" SET "balance" = "startingBalance", "equity" = "startingBalance",
+              "dailyPnl" = 0, "totalPnl" = 0, "drawdown" = 0, "highestEquity" = "startingBalance",
+              "dayStartEquity" = "startingBalance", "dayStartAt" = CURRENT_DATE,
+              "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
+      [accountId],
+    );
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/** Admin manual balance credit/debit. Records a ledger entry and bumps cash/equity. */
+export async function adminAdjustBalance(accountId: string, amount: number): Promise<boolean> {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+    const res = await client.query(
+      `UPDATE "Account" SET "balance" = "balance" + $2, "equity" = "equity" + $2, "updatedAt" = now() WHERE "id" = $1 RETURNING "id"`,
+      [accountId, amount],
+    );
+    if (res.rowCount === 0) {
+      await client.query("ROLLBACK");
+      return false;
+    }
+    const type = amount >= 0 ? "DEPOSIT" : "WITHDRAWAL";
+    await client.query(`INSERT INTO "Transaction" ("accountId","type","amount","description") VALUES ($1,$2,$3,'Balance adjustment by admin')`, [accountId, type, amount]);
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
 }
 
 /** Generic activity insert (also reused for USER_LOGIN). */

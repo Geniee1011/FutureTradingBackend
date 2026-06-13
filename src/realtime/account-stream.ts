@@ -2,6 +2,7 @@ import type { WebSocket } from "ws";
 import { verifyToken, type Role } from "../auth/jwt.js";
 import { useDatabase } from "../config.js";
 import type { MarketDataProvider } from "../providers/provider.js";
+import { getMultiplier } from "../instruments.js";
 import {
   getAccountIdByUserId,
   getAccountSnapshot,
@@ -139,7 +140,7 @@ export class AccountStream {
       return {
         ...p,
         markPrice: round(mark, 4),
-        unrealizedPnl: round((mark - p.avgPrice) * p.quantity * dir, 2),
+        unrealizedPnl: round((mark - p.avgPrice) * p.quantity * dir * getMultiplier(p.symbol), 2),
       };
     });
   }
@@ -193,7 +194,7 @@ export class AccountStream {
     let u = 0;
     for (const p of acc.positions) {
       const mark = this.quotes.get(p.symbol) ?? p.markPrice ?? p.avgPrice;
-      u += (mark - p.avgPrice) * p.quantity * (p.side === "buy" ? 1 : -1);
+      u += (mark - p.avgPrice) * p.quantity * (p.side === "buy" ? 1 : -1) * getMultiplier(p.symbol);
     }
     return u;
   }
@@ -211,7 +212,7 @@ export class AccountStream {
     for (const p of acc.positions) {
       const mark = this.quotes.get(p.symbol) ?? p.markPrice ?? p.avgPrice;
       const dir = p.side === "buy" ? 1 : -1;
-      const pnl = (mark - p.avgPrice) * p.quantity * dir;
+      const pnl = (mark - p.avgPrice) * p.quantity * dir * getMultiplier(p.symbol);
       unrealized += pnl;
       if (wantsPositions) {
         this.send(ws, {

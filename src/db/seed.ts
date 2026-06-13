@@ -1,6 +1,8 @@
 import "dotenv/config";
+import { WebSocket } from "ws";
 import { getPool, closePool } from "./pool.js";
 import { hashPassword } from "../auth/password.js";
+import { getInstrument } from "../instruments.js";
 
 /* Seeds demo users + an evaluation account/rule for the trader.
    Idempotent (upserts on unique keys). Run via `npm run db:seed`. */
@@ -9,6 +11,60 @@ const USERS = [
   { email: "admin@demo.com", name: "Alex Admin", password: "demo", role: "ADMIN" },
   { email: "trader@demo.com", name: "Marvin Weiss", password: "demo", role: "TRADER" },
 ] as const;
+
+const MARK_SYMBOLS = ["ES", "NQ", "CL", "GC"] as const;
+
+function roundTo(symbol: string, price: number): number {
+  const f = 10 ** (getInstrument(symbol)?.pricePrecision ?? 2);
+  return Math.round(price * f) / f;
+}
+
+/**
+ * Best-effort: pull current marks from the running backend's WS (it sends a quote
+ * snapshot on subscribe). Lets the demo positions/orders be priced near the LIVE
+ * market so P&L stays modest and the account stays ACTIVE — instead of going
+ * deeply under/over water against stale simBase levels. Falls back to simBase
+ * (per-symbol) if the backend isn't reachable.
+ */
+async function fetchLiveMarks(symbols: readonly string[]): Promise<Record<string, number>> {
+  const port = process.env.PORT ?? "8000";
+  const marks: Record<string, number> = {};
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const ws = new WebSocket(`ws://localhost:${port}/ws`);
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      try {
+        ws.close();
+      } catch {
+        /* ignore */
+      }
+      resolve();
+    };
+    const timer = setTimeout(finish, 4000);
+    ws.on("open", () => symbols.forEach((s) => ws.send(JSON.stringify({ type: "subscribe", channel: "quotes", symbol: s }))));
+    ws.on("message", (raw) => {
+      try {
+        const msg = JSON.parse(String(raw)) as { type?: string; data?: { symbol: string; price: number } };
+        if (msg.type === "quote" && msg.data && marks[msg.data.symbol] == null) {
+          marks[msg.data.symbol] = msg.data.price;
+          if (symbols.every((s) => marks[s] != null)) {
+            clearTimeout(timer);
+            finish();
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+    ws.on("error", () => {
+      clearTimeout(timer);
+      finish();
+    });
+  });
+  return marks;
+}
 
 async function main() {
   if (!process.env.DATABASE_URL) {
@@ -38,9 +94,13 @@ async function main() {
   const traderId = rows[0]?.id;
   if (traderId) {
     const acc = await pool.query<{ id: string }>(
-      `INSERT INTO "Account" ("userId","startingBalance","balance","equity","highestEquity","status")
-       VALUES ($1, 50000, 50000, 50000, 50000, 'ACTIVE')
-       ON CONFLICT ("userId") DO UPDATE SET "updatedAt" = now()
+      `INSERT INTO "Account" ("userId","startingBalance","balance","equity","highestEquity","status","dayStartEquity","dayStartAt")
+       VALUES ($1, 50000, 50000, 50000, 50000, 'ACTIVE', 50000, CURRENT_DATE)
+       ON CONFLICT ("userId") DO UPDATE SET
+         "startingBalance" = 50000, "balance" = 50000, "equity" = 50000, "highestEquity" = 50000,
+         "dailyPnl" = 0, "totalPnl" = 0, "drawdown" = 0,
+         "dayStartEquity" = 50000, "dayStartAt" = CURRENT_DATE,
+         "status" = 'ACTIVE', "updatedAt" = now()
        RETURNING "id"`,
       [traderId],
     );
@@ -63,11 +123,23 @@ async function main() {
     await pool.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
     await pool.query(`DELETE FROM "Order" WHERE "accountId" = $1`, [accountId]);
 
+    // Price the demo positions near the LIVE mark (fetched above) so each one's
+    // dollar P&L (× contract multiplier) is small and bounded — a mix of green/red
+    // that keeps the account comfortably ACTIVE. Offsets are in price points.
+    //
+    // DRIFT-PROOFING: seed MICRO contracts (MES/MNQ/MCL/MGC, 1/10th the point value
+    // of their E-mini parents) rather than full-size. The open book still marks live
+    // off the parent's quote (micros trade at the same price level), but the dollar
+    // swing is ~10× smaller — so an unattended demo account can't drift through the
+    // $3,000 max-drawdown limit over hours of live market movement. `base` is the
+    // symbol we pull the live mark from (micros aren't separately quoted server-side).
+    const marks = await fetchLiveMarks(MARK_SYMBOLS);
+    const markOf = (s: string) => marks[s] ?? getInstrument(s)!.simBase;
     const positions = [
-      { symbol: "ES", side: "LONG", qty: 2, avg: 7560.0 },
-      { symbol: "NQ", side: "SHORT", qty: 1, avg: 30400.0 },
-      { symbol: "CL", side: "LONG", qty: 3, avg: 92.5 },
-      { symbol: "GC", side: "LONG", qty: 1, avg: 4480.0 },
+      { symbol: "MES", base: "ES", side: "LONG", qty: 1, avg: roundTo("MES", markOf("ES") - 8) }, // MES $5/pt → ~+$40
+      { symbol: "MNQ", base: "NQ", side: "SHORT", qty: 1, avg: roundTo("MNQ", markOf("NQ") + 25) }, // MNQ $2/pt → ~+$50
+      { symbol: "MCL", base: "CL", side: "LONG", qty: 1, avg: roundTo("MCL", markOf("CL") + 0.2) }, // MCL $100/pt → ~-$20 (red)
+      { symbol: "MGC", base: "GC", side: "LONG", qty: 1, avg: roundTo("MGC", markOf("GC") - 4) }, // MGC $10/pt → ~+$40
     ];
     for (const p of positions) {
       await pool.query(
@@ -77,11 +149,15 @@ async function main() {
       );
     }
 
+    // Working orders priced clear of the live mark so the resting-order monitor
+    // does NOT immediately trigger them (buy-limit below, sell-limit above,
+    // sell-stop below). The MGC market order is historical (it opened the MGC pos).
+    // Micro symbols match the seeded positions; priced off the parent's live mark.
     const orders = [
-      { symbol: "ES", side: "BUY", type: "LIMIT", status: "PENDING", qty: 1, filled: 0, req: 7500.0, fill: null },
-      { symbol: "NQ", side: "SELL", type: "LIMIT", status: "PENDING", qty: 1, filled: 0, req: 30600.0, fill: null },
-      { symbol: "GC", side: "BUY", type: "MARKET", status: "FILLED", qty: 1, filled: 1, req: null, fill: 4485.0 },
-      { symbol: "CL", side: "SELL", type: "STOP", status: "PENDING", qty: 2, filled: 0, req: 90.0, fill: null },
+      { symbol: "MES", side: "BUY", type: "LIMIT", status: "PENDING", qty: 1, filled: 0, req: roundTo("MES", markOf("ES") - 60), fill: null },
+      { symbol: "MNQ", side: "SELL", type: "LIMIT", status: "PENDING", qty: 1, filled: 0, req: roundTo("MNQ", markOf("NQ") + 120), fill: null },
+      { symbol: "MGC", side: "BUY", type: "MARKET", status: "FILLED", qty: 1, filled: 1, req: null, fill: roundTo("MGC", markOf("GC") - 4) },
+      { symbol: "MCL", side: "SELL", type: "STOP", status: "PENDING", qty: 1, filled: 0, req: roundTo("MCL", markOf("CL") - 3), fill: null },
     ];
     for (const o of orders) {
       await pool.query(
@@ -95,9 +171,9 @@ async function main() {
     await pool.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
     const txns = [
       { type: "DEPOSIT", amount: 50000, desc: "Initial deposit", daysAgo: 30 },
-      { type: "TRADE", amount: 1240.0, desc: "Realized P&L · ES", daysAgo: 3 },
+      { type: "TRADE", amount: 1240.0, desc: "Realized P&L · MES", daysAgo: 3 },
       { type: "FEE", amount: -4.5, desc: "Trading commission", daysAgo: 3 },
-      { type: "TRADE", amount: -380.5, desc: "Realized P&L · NQ", daysAgo: 2 },
+      { type: "TRADE", amount: -380.5, desc: "Realized P&L · MNQ", daysAgo: 2 },
       { type: "FUNDING", amount: -12.2, desc: "Overnight funding", daysAgo: 1 },
       { type: "FEE", amount: -8.0, desc: "Trading commission", daysAgo: 0 },
     ];

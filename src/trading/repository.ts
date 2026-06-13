@@ -5,6 +5,29 @@ import { SYMBOLS } from "../instruments.js";
 const STARTING_BALANCE = 50_000;
 const DEFAULT_RULE = { maxDailyLoss: 2_500, maxDrawdown: 3_000, profitTarget: 6_000, maxContracts: 5 };
 
+export interface ViolationRecord {
+  id: string;
+  ts: number;
+  type: string;
+  action: string;
+  detail: string | null;
+}
+
+/** A trader's own rule violations (newest first) for the violation-status view. */
+export async function listViolations(accountId: string): Promise<ViolationRecord[]> {
+  const { rows } = await getPool().query(
+    `SELECT "id","type","action","detail","createdAt" FROM "Violation" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 100`,
+    [accountId],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    ts: new Date(r.createdAt).getTime(),
+    type: r.type,
+    action: r.action,
+    detail: r.detail ?? null,
+  }));
+}
+
 /**
  * Provision a default evaluation account (Account + Rule + opening deposit) for a
  * user, atomically. Idempotent: does nothing if the user already has an account.

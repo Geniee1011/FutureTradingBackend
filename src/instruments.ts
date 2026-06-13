@@ -20,19 +20,25 @@ export interface Instrument {
   simBase: number;
   /** Minimum tick size, used to build a synthetic depth ladder. */
   tickSize: number;
+  /**
+   * Contract point value in USD — dollars of P&L per 1.00 of price movement, per
+   * contract. P&L = (price - avg) × qty × multiplier. e.g. ES = $50/pt, NQ = $20/pt.
+   * Without this, dollar P&L (and every dollar-based eval rule) is wrong.
+   */
+  multiplier: number;
 }
 
 export const INSTRUMENTS: Instrument[] = [
-  { symbol: "ES", databentoSymbol: "ES.v.0", name: "E-mini S&P 500", category: "Equity Index", pricePrecision: 2, simBase: 7574, tickSize: 0.25 },
-  { symbol: "MES", databentoSymbol: "MES.v.0", name: "Micro E-mini S&P 500", category: "Equity Index", pricePrecision: 2, simBase: 7574, tickSize: 0.25 },
-  { symbol: "NQ", databentoSymbol: "NQ.v.0", name: "E-mini Nasdaq-100", category: "Equity Index", pricePrecision: 2, simBase: 30264, tickSize: 0.25 },
-  { symbol: "MNQ", databentoSymbol: "MNQ.v.0", name: "Micro E-mini Nasdaq-100", category: "Equity Index", pricePrecision: 2, simBase: 30264, tickSize: 0.25 },
-  { symbol: "YM", databentoSymbol: "YM.v.0", name: "E-mini Dow ($5)", category: "Equity Index", pricePrecision: 0, simBase: 47000, tickSize: 1 },
-  { symbol: "MYM", databentoSymbol: "MYM.v.0", name: "Micro E-mini Dow ($0.50)", category: "Equity Index", pricePrecision: 0, simBase: 47000, tickSize: 1 },
-  { symbol: "CL", databentoSymbol: "CL.v.0", name: "Crude Oil (WTI)", category: "Energy", pricePrecision: 2, simBase: 93, tickSize: 0.01 },
-  { symbol: "MCL", databentoSymbol: "MCL.v.0", name: "Micro Crude Oil", category: "Energy", pricePrecision: 2, simBase: 93, tickSize: 0.01 },
-  { symbol: "GC", databentoSymbol: "GC.v.0", name: "Gold", category: "Metals", pricePrecision: 1, simBase: 4488, tickSize: 0.1 },
-  { symbol: "MGC", databentoSymbol: "MGC.v.0", name: "Micro Gold", category: "Metals", pricePrecision: 1, simBase: 4488, tickSize: 0.1 },
+  { symbol: "ES", databentoSymbol: "ES.v.0", name: "E-mini S&P 500", category: "Equity Index", pricePrecision: 2, simBase: 7574, tickSize: 0.25, multiplier: 50 },
+  { symbol: "MES", databentoSymbol: "MES.v.0", name: "Micro E-mini S&P 500", category: "Equity Index", pricePrecision: 2, simBase: 7574, tickSize: 0.25, multiplier: 5 },
+  { symbol: "NQ", databentoSymbol: "NQ.v.0", name: "E-mini Nasdaq-100", category: "Equity Index", pricePrecision: 2, simBase: 30264, tickSize: 0.25, multiplier: 20 },
+  { symbol: "MNQ", databentoSymbol: "MNQ.v.0", name: "Micro E-mini Nasdaq-100", category: "Equity Index", pricePrecision: 2, simBase: 30264, tickSize: 0.25, multiplier: 2 },
+  { symbol: "YM", databentoSymbol: "YM.v.0", name: "E-mini Dow ($5)", category: "Equity Index", pricePrecision: 0, simBase: 47000, tickSize: 1, multiplier: 5 },
+  { symbol: "MYM", databentoSymbol: "MYM.v.0", name: "Micro E-mini Dow ($0.50)", category: "Equity Index", pricePrecision: 0, simBase: 47000, tickSize: 1, multiplier: 0.5 },
+  { symbol: "CL", databentoSymbol: "CL.v.0", name: "Crude Oil (WTI)", category: "Energy", pricePrecision: 2, simBase: 93, tickSize: 0.01, multiplier: 1000 },
+  { symbol: "MCL", databentoSymbol: "MCL.v.0", name: "Micro Crude Oil", category: "Energy", pricePrecision: 2, simBase: 93, tickSize: 0.01, multiplier: 100 },
+  { symbol: "GC", databentoSymbol: "GC.v.0", name: "Gold", category: "Metals", pricePrecision: 1, simBase: 4488, tickSize: 0.1, multiplier: 100 },
+  { symbol: "MGC", databentoSymbol: "MGC.v.0", name: "Micro Gold", category: "Metals", pricePrecision: 1, simBase: 4488, tickSize: 0.1, multiplier: 10 },
 ];
 
 export const SYMBOLS = INSTRUMENTS.map((i) => i.symbol);
@@ -42,6 +48,11 @@ const byDatabento = new Map(INSTRUMENTS.map((i) => [i.databentoSymbol, i]));
 
 export function getInstrument(symbol: string): Instrument | undefined {
   return bySymbol.get(symbol);
+}
+
+/** Contract point value in USD for a symbol (defaults to 1 for unknown symbols). */
+export function getMultiplier(symbol: string): number {
+  return bySymbol.get(symbol)?.multiplier ?? 1;
 }
 
 export function getByDatabentoSymbol(dbSymbol: string): Instrument | undefined {
