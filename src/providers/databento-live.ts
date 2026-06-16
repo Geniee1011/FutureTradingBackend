@@ -124,7 +124,10 @@ export class DatabentoLiveProvider extends BaseProvider {
 
   // --- instrument id mapping ---------------------------------------
 
-  private async resolveIds(): Promise<void> {
+  private async resolveIds(attempt = 0): Promise<void> {
+    // Without this id→symbol map, incoming live trades can't be decoded and are
+    // dropped — so if the call fails/times out (e.g. slow hop to Databento), keep
+    // retrying with backoff until the map is populated. Critical on cloud hosts.
     try {
       const map = await this.client.resolveInstrumentIds(INSTRUMENTS.map((i) => i.databentoSymbol), Date.now());
       for (const inst of INSTRUMENTS) {
@@ -133,6 +136,10 @@ export class DatabentoLiveProvider extends BaseProvider {
       }
     } catch (err) {
       this.logError(err);
+    }
+    if (this.idToSymbol.size === 0 && this.running && attempt < 8) {
+      const delay = Math.min(2000 * 2 ** attempt, 30_000);
+      setTimeout(() => void this.resolveIds(attempt + 1), delay);
     }
   }
 

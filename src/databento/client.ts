@@ -89,9 +89,12 @@ export class DatabentoClient {
     if (this.rangeInflight) return this.rangeInflight;
 
     this.rangeInflight = (async () => {
-      const res = await fetchWithRetry(`${HIST_BASE}/metadata.get_dataset_range?dataset=${this.dataset}`, {
-        headers: { Authorization: this.authHeader() },
-      });
+      const res = await fetchWithRetry(
+        `${HIST_BASE}/metadata.get_dataset_range?dataset=${this.dataset}`,
+        { headers: { Authorization: this.authHeader() } },
+        HISTORY_RETRIES,
+        HISTORY_TIMEOUT_MS,
+      );
       if (!res.ok) throw new Error(`Databento range ${res.status}`);
       const body = (await res.json()) as { schema?: Record<string, { start: string; end: string }> };
       const ends: Record<string, number> = {};
@@ -212,9 +215,16 @@ export class DatabentoClient {
       start_date: date,
       end_date: next,
     });
-    const res = await fetchWithRetry(`${HIST_BASE}/symbology.resolve?${qs.toString()}`, {
-      headers: { Authorization: this.authHeader() },
-    });
+    // Critical for the live feed: this maps instrument-ids → symbols so incoming
+    // trades can be decoded. Use the longer budget (not the 10s default) — on a
+    // higher-latency host (e.g. a cloud region far from Databento) the short
+    // timeout fails, the id-map stays empty, and every live trade is dropped.
+    const res = await fetchWithRetry(
+      `${HIST_BASE}/symbology.resolve?${qs.toString()}`,
+      { headers: { Authorization: this.authHeader() } },
+      HISTORY_RETRIES,
+      HISTORY_TIMEOUT_MS,
+    );
     if (!res.ok) {
       // Surface the body + the requested window — a 422 here is almost always a
       // date/symbol-range rejection (e.g. end_date past the dataset's edge).
