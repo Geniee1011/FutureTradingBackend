@@ -14,6 +14,23 @@ import { OrderEngine } from "./trading/order-engine.js";
 import { RiskEngine } from "./trading/risk-engine.js";
 
 function buildProvider(): MarketDataProvider {
+  // Model B — "byo": per-user (bring-your-own) Databento accounts. Chart data
+  // (history + polled quote) is served per-request from each user's OWN key via
+  // REST (/api/history, /api/market-data/quote) — NO shared market-data fan-out,
+  // which is what keeps Model B out of redistribution. The shared provider below
+  // therefore carries no real market data; it only backs the simulated execution
+  // engine (order fills / mark for the eval), so charts are the user's real data
+  // while trading runs on the simulation. (Per-user fill pricing is a follow-up.)
+  if (config.marketDataMode === "byo") {
+    if (!config.marketDataEncKey) {
+      console.warn("[provider] MARKET_DATA_MODE=byo but MARKET_DATA_ENC_KEY is unset — users cannot connect a key.");
+    }
+    console.log("[provider] Market-data model: BYO (Model B — per-user keys; charts via REST, execution simulated)");
+    return new SimulationProvider();
+  }
+
+  // Model A — "shared": one master key, fanned out to all users (current behaviour).
+  console.log("[provider] Market-data model: SHARED (Model A — single master key, fanned out)");
   if (useDatabento && config.databento.live) {
     console.log("[provider] Databento LIVE feed (raw TCP / DBN) — dataset", config.databento.dataset);
     return new DatabentoLiveProvider(config.databento.apiKey, config.databento.dataset);

@@ -45,6 +45,14 @@ export class PgUserStore implements UserStore {
     }
   }
 
+  async updatePassword(id: string, newPassword: string): Promise<boolean> {
+    const res = await getPool().query(
+      `UPDATE "User" SET "passwordHash" = $1, "updatedAt" = now() WHERE "id" = $2`,
+      [hashPassword(newPassword), id],
+    );
+    return (res.rowCount ?? 0) > 0;
+  }
+
   private map(r: UserRow): User {
     return {
       id: r.id,

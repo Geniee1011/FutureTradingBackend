@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS "User" (
 );
 CREATE INDEX IF NOT EXISTS "User_role_status_idx" ON "User" ("role","status");
 
+-- Model B (MARKET_DATA_MODE=byo): each user's OWN Databento API key, encrypted
+-- at rest (AES-256-GCM via MARKET_DATA_ENC_KEY). NULL = not connected.
+ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "databentoKeyEnc" text;
+
 CREATE TABLE IF NOT EXISTS "Account" (
   "id"              text PRIMARY KEY DEFAULT gen_random_uuid()::text,
   "userId"          text UNIQUE NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
@@ -139,3 +143,21 @@ CREATE TABLE IF NOT EXISTS "Transaction" (
   "createdAt"   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS "Transaction_accountId_createdAt_idx" ON "Transaction" ("accountId","createdAt");
+
+-- A historical record of every closed (or partially closed) position. The live
+-- "Position" row is deleted on full close, so this is the durable trade log the
+-- admin "Positions" view reads for closed trades.
+CREATE TABLE IF NOT EXISTS "ClosedPosition" (
+  "id"          text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  "accountId"   text NOT NULL REFERENCES "Account"("id") ON DELETE CASCADE,
+  "symbol"      text NOT NULL,
+  "side"        "PositionSide" NOT NULL,
+  "quantity"    integer NOT NULL,
+  "entryPrice"  numeric(18,4) NOT NULL,
+  "exitPrice"   numeric(18,4) NOT NULL,
+  "realizedPnl" numeric(18,2) NOT NULL,
+  "openedAt"    timestamptz NOT NULL,
+  "closedAt"    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS "ClosedPosition_accountId_closedAt_idx" ON "ClosedPosition" ("accountId","closedAt");
+CREATE INDEX IF NOT EXISTS "ClosedPosition_closedAt_idx" ON "ClosedPosition" ("closedAt");

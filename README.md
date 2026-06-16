@@ -167,5 +167,116 @@ src/
 ## Configuration
 
 See `.env.example`. Key vars: `PORT` (8000), `CORS_ORIGIN`
-(`http://localhost:3000`), `DATABENTO_API_KEY`, `DATABENTO_DATASET`
-(`GLBX.MDP3`), `QUOTE_POLL_MS` (1500).
+(`http://localhost:3000`), `MARKET_DATA_MODE` (`shared`), `DATABENTO_API_KEY`,
+`DATABENTO_DATASET` (`GLBX.MDP3`), `QUOTE_POLL_MS` (1500).
+
+## Market-data models
+
+`MARKET_DATA_MODE` selects how market data is delivered **and licensed**, so you
+can switch models without code changes (just an env var + redeploy):
+
+| Mode | Model | How it works | Licensing |
+| --- | --- | --- | --- |
+| `shared` *(default)* | **A** | One master `DATABENTO_API_KEY`; the backend fans the feed out to all users via the shared `MarketHub`. | Counts as **redistribution** → needs a redistribution/vendor license. |
+| `byo` | **B** | Each user brings their **own** Databento account; the app streams only the data their own license covers. | No redistribution (per-user entitlements). |
+
+The switch point lives in `buildProvider()` ([src/index.ts](src/index.ts)): `shared`
+runs the current single-key path (Databento Live / Historical, or Simulation when
+no key is set); `byo` is where the per-user provider slots in.
+
+**Model B (`byo`) is implemented end-to-end** (historical/delayed MVP):
+
+- Each user's Databento key is stored **encrypted at rest** (`databentoKeyEnc`
+  column, AES-256-GCM via `MARKET_DATA_ENC_KEY`) and validated against Databento
+  before saving.
+- Chart **history** (`GET /api/history`) and the **polled latest price**
+  (`GET /api/market-data/quote`) are served per-request with the **requesting
+  user's own key** — never shared, so no redistribution.
+- Connection endpoints: `GET/POST/DELETE /api/market-data/connection`.
+- Frontend: users connect/disconnect via the avatar menu → **Databento account**;
+  the chart shows a **"Connect your Databento account"** gate until they do.
+- In `byo`, the shared provider carries no market data — it only backs the
+  **simulated execution** engine (order fills / eval run on the simulation, while
+  charts are the user's real data). Per-user fill pricing is a future follow-up.
+
+> **Before switching a real deployment to `byo`**, get Databento's **written**
+> confirmation that BYO-key access avoids the redistribution classification (see
+> the licensing email in the project notes). Both models share the one
+> `buildProvider()` seam, so toggling between them — or rolling back to `shared` —
+> is a flag flip, not a code change. (Rolling back to `shared` re-introduces
+> redistribution, so it requires holding the redistribution license then.)
+
+## Deployment (Railway + Vercel)
+
+Managed-PaaS topology: **backend + Postgres on Railway**, **frontend on Vercel**.
+The backend must run as a **single always-on process** — it holds a persistent
+Databento socket, in-memory engine state (quotes, account caches, the resting-order
+monitor), and pooled Postgres connections — so it can't go serverless. The
+`railway.json` in this repo pins it to **one replica** with a `/health` check.
+
+### Backend → Railway
+
+1. **New Project → Deploy from `FutureTradingBackend`.** Railway reads
+   `railway.json` (Nixpacks build `npm run build`, start `npm run start`,
+   healthcheck `/health`, 1 replica).
+2. **Add Postgres:** *+ New → Database → PostgreSQL.* Railway injects
+   `DATABASE_URL` into the service automatically.
+3. **Set service variables** (Settings → Variables):
+
+   | Variable | Value |
+   | --- | --- |
+   | `JWT_SECRET` | a long random string (**not** the dev default) |
+   | `DATABENTO_API_KEY` | your Databento key |
+   | `DATABENTO_LIVE` | `1` for the live feed, omit for delayed/historical |
+   | `CORS_ORIGIN` | `https://<your-app>.vercel.app` (lock it down) |
+   | `DATABENTO_DATASET` | `GLBX.MDP3` (default — optional) |
+
+   **Do not set `PORT`** — Railway injects it and the server already reads
+   `process.env.PORT`.
+4. **Initialize the database once** (Railway shell or a one-off command):
+
+   ```bash
+   npm run db:migrate   # idempotent — safe to re-run
+   npm run db:seed      # demo users + a $50k eval account (optional)
+   ```
+
+5. Your service URL is `https://<svc>.up.railway.app`; the WebSocket is
+   **`wss://<svc>.up.railway.app/ws`**.
+
+> **Optional zero-touch migrations.** To auto-apply the schema on every deploy,
+> change `startCommand` in `railway.json` to `npm run db:migrate && npm run start`.
+> Safe because the schema is fully idempotent (every `CREATE`/`ALTER` is guarded).
+> Relies on `tsx` at runtime — keep dev dependencies installed (Nixpacks does by
+> default).
+
+### Frontend → Vercel
+
+1. **New Project → import `FutureTradingApp`** (Next.js auto-detected; defaults are fine).
+2. **Environment variable:**
+
+   | Variable | Value |
+   | --- | --- |
+   | `NEXT_PUBLIC_WS_URL` | `wss://<svc>.up.railway.app/ws` |
+
+   The app derives the REST base from this var (`ws→http`, strip `/ws`), so the
+   backend must serve REST **and** WS on the **same host** (it does). Leave
+   `NEXT_PUBLIC_TV_ADVANCED` unset unless you've added the licensed TradingView
+   library.
+3. **Deploy** → `https://<your-app>.vercel.app`.
+
+### Deploy order & gotchas
+
+1. **Backend + Postgres first** → copy the Railway URL → set `NEXT_PUBLIC_WS_URL`
+   on Vercel → deploy the frontend.
+2. **WSS is required.** Once the frontend is on HTTPS, the socket must be `wss://`
+   or browsers block it as mixed content. Railway provides TLS automatically.
+3. **Secrets live in the dashboards, never in git.** Both repos are public; `.env`
+   (paid Databento key + JWT secret) must stay gitignored.
+4. **Don't scale the backend past 1 replica** and don't use a tier that **sleeps
+   on idle** — it holds the live feed and in-memory caches (`railway.json` pins
+   `numReplicas: 1`). A cold start drops the Databento socket and wipes state.
+5. **After re-seeding a running backend, restart the service** — the account-stream
+   caches positions in memory at boot, so a reseed against a live process leaves
+   stale equity/drawdown until restart.
+6. **Node 20+ LTS.** Pin with a `.nvmrc` or `"engines": { "node": ">=20" }` in
+   `package.json` if Railway selects an older default.

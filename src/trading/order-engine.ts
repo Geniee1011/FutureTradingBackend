@@ -42,6 +42,7 @@ interface PositionRow {
   side: "LONG" | "SHORT";
   quantity: number;
   averagePrice: number;
+  openedAt?: Date;
 }
 
 interface WorkingOrder {
@@ -309,7 +310,7 @@ export class OrderEngine {
 
   private async getPosition(client: PoolClient, accountId: string, symbol: string): Promise<PositionRow | null> {
     const { rows } = await client.query<PositionRow>(
-      `SELECT "id","side","quantity","averagePrice" FROM "Position"
+      `SELECT "id","side","quantity","averagePrice","openedAt" FROM "Position"
        WHERE "accountId" = $1 AND "symbol" = $2 FOR UPDATE`,
       [accountId, symbol],
     );
@@ -365,6 +366,20 @@ export class OrderEngine {
     const closedQty = Math.min(qty, existing.quantity);
     const realized = Math.round((fillPrice - existing.averagePrice) * closedQty * dir * getMultiplier(symbol) * 100) / 100;
 
+    // Durable record of the closed (or reduced) portion — the live Position row
+    // may be deleted below, so this is what the admin Positions view reads.
+    await this.recordClosedPosition(
+      client,
+      accountId,
+      symbol,
+      existing.side,
+      closedQty,
+      existing.averagePrice,
+      fillPrice,
+      realized,
+      existing.openedAt,
+    );
+
     if (qty < existing.quantity) {
       await client.query(`UPDATE "Position" SET "quantity" = $2, "realizedPnl" = "realizedPnl" + $3, "updatedAt" = now() WHERE "id" = $1`, [
         existing.id,
@@ -384,6 +399,26 @@ export class OrderEngine {
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty - existing.quantity} ${symbol} @ ${round(fillPrice)}`);
     }
     return realized;
+  }
+
+  /** Append a closed-position record (one per realizing close/reduce/flip). */
+  private async recordClosedPosition(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    side: "LONG" | "SHORT",
+    quantity: number,
+    entryPrice: number,
+    exitPrice: number,
+    realizedPnl: number,
+    openedAt: Date | undefined,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO "ClosedPosition"
+         ("accountId","symbol","side","quantity","entryPrice","exitPrice","realizedPnl","openedAt")
+       VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, now()))`,
+      [accountId, symbol, side, quantity, entryPrice, exitPrice, realizedPnl, openedAt ?? null],
+    );
   }
 
   /** Write the Fill, net it into the position, and book realized P&L. Returns realized. */

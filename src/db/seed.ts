@@ -167,6 +167,27 @@ async function main() {
       );
     }
 
+    // A few CLOSED positions (round-trip trades) so the admin Positions view has
+    // history. Realized P&L = (exit−entry) for longs / (entry−exit) for shorts,
+    // × qty × contract multiplier, rounded to cents. Idempotent: reset first.
+    await pool.query(`DELETE FROM "ClosedPosition" WHERE "accountId" = $1`, [accountId]);
+    const closedTrades = [
+      { symbol: "MES", side: "LONG", qty: 1, entry: roundTo("MES", markOf("ES") - 12), exit: roundTo("MES", markOf("ES") - 2), dOpen: 5, dClose: 4 },
+      { symbol: "MNQ", side: "SHORT", qty: 2, entry: roundTo("MNQ", markOf("NQ") + 30), exit: roundTo("MNQ", markOf("NQ") + 10), dOpen: 4, dClose: 3 },
+      { symbol: "MCL", side: "LONG", qty: 1, entry: roundTo("MCL", markOf("CL") + 0.3), exit: roundTo("MCL", markOf("CL") + 0.1), dOpen: 3, dClose: 2 }, // red
+      { symbol: "MGC", side: "LONG", qty: 1, entry: roundTo("MGC", markOf("GC") - 6), exit: roundTo("MGC", markOf("GC") - 1), dOpen: 2, dClose: 1 },
+    ];
+    for (const c of closedTrades) {
+      const mult = getInstrument(c.symbol)!.multiplier;
+      const realized = Math.round((c.side === "LONG" ? c.exit - c.entry : c.entry - c.exit) * c.qty * mult * 100) / 100;
+      await pool.query(
+        `INSERT INTO "ClosedPosition" ("accountId","symbol","side","quantity","entryPrice","exitPrice","realizedPnl","openedAt","closedAt")
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [accountId, c.symbol, c.side, c.qty, c.entry, c.exit, realized,
+         new Date(Date.now() - c.dOpen * 86_400_000), new Date(Date.now() - c.dClose * 86_400_000)],
+      );
+    }
+
     // Transaction history.
     await pool.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
     const txns = [

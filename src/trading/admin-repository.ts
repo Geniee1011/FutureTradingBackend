@@ -228,6 +228,90 @@ export async function adminListViolations(limit = 200): Promise<AdminViolationRo
   }));
 }
 
+export interface AdminOpenPosition {
+  id: string;
+  traderId: string;
+  traderName: string;
+  accountId: string;
+  symbol: string;
+  side: string; // LONG | SHORT
+  quantity: number;
+  averagePrice: number;
+  realizedPnl: number;
+  unrealizedPnl: number;
+  openedAt: number;
+}
+
+export interface AdminClosedPosition {
+  id: string;
+  traderId: string;
+  traderName: string;
+  accountId: string;
+  symbol: string;
+  side: string;
+  quantity: number;
+  entryPrice: number;
+  exitPrice: number;
+  realizedPnl: number;
+  openedAt: number;
+  closedAt: number;
+}
+
+/** Every OPEN position across all accounts (admin-wide Positions view). */
+export async function adminListOpenPositions(): Promise<AdminOpenPosition[]> {
+  const { rows } = await getPool().query(
+    `SELECT p."id", p."symbol", p."side", p."quantity", p."averagePrice",
+            p."realizedPnl", p."unrealizedPnl", p."openedAt", p."accountId",
+            u."id" AS "traderId", u."name", u."email"
+     FROM "Position" p
+     JOIN "Account" a ON a."id" = p."accountId"
+     JOIN "User" u ON u."id" = a."userId"
+     ORDER BY p."openedAt" DESC`,
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    traderId: r.traderId,
+    traderName: r.name ?? r.email,
+    accountId: r.accountId,
+    symbol: r.symbol,
+    side: r.side,
+    quantity: Number(r.quantity),
+    averagePrice: Number(r.averagePrice),
+    realizedPnl: Number(r.realizedPnl),
+    unrealizedPnl: Number(r.unrealizedPnl),
+    openedAt: ms(r.openedAt),
+  }));
+}
+
+/** Every CLOSED position across all accounts, newest first (admin-wide Positions view). */
+export async function adminListClosedPositions(limit = 500): Promise<AdminClosedPosition[]> {
+  const { rows } = await getPool().query(
+    `SELECT c."id", c."symbol", c."side", c."quantity", c."entryPrice", c."exitPrice",
+            c."realizedPnl", c."openedAt", c."closedAt", c."accountId",
+            u."id" AS "traderId", u."name", u."email"
+     FROM "ClosedPosition" c
+     JOIN "Account" a ON a."id" = c."accountId"
+     JOIN "User" u ON u."id" = a."userId"
+     ORDER BY c."closedAt" DESC
+     LIMIT $1`,
+    [limit],
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    traderId: r.traderId,
+    traderName: r.name ?? r.email,
+    accountId: r.accountId,
+    symbol: r.symbol,
+    side: r.side,
+    quantity: Number(r.quantity),
+    entryPrice: Number(r.entryPrice),
+    exitPrice: Number(r.exitPrice),
+    realizedPnl: Number(r.realizedPnl),
+    openedAt: ms(r.openedAt),
+    closedAt: ms(r.closedAt),
+  }));
+}
+
 // --- single-trader detail (admin/traders/:id) ---
 
 export interface AdminTraderAccount {

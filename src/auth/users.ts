@@ -30,6 +30,8 @@ export interface UserStore {
   findByEmail(email: string): Promise<User | null>;
   findById(id: string): Promise<User | null>;
   create(input: { email: string; password: string; name: string; role?: Role }): Promise<User>;
+  /** Set a new password (plaintext; hashed by the store). Returns false if the user is unknown. */
+  updatePassword(id: string, newPassword: string): Promise<boolean>;
 }
 
 /** Seeded in-memory store (demo users). Mirrors the frontend demo accounts. */
@@ -78,5 +80,12 @@ export class MemoryUserStore implements UserStore {
     this.byId.set(user.id, user);
     this.byEmail.set(user.email, user);
     return user;
+  }
+
+  async updatePassword(id: string, newPassword: string): Promise<boolean> {
+    const user = this.byId.get(id);
+    if (!user) return false;
+    user.passwordHash = hashPassword(newPassword);
+    return true;
   }
 }

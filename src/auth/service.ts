@@ -33,6 +33,26 @@ export class AuthService {
     return { token: signToken(this.payload(user.id, user.email, user.role)), user: toPublicUser(user) };
   }
 
+  /** Self-service password change: verify the current password, then set a new one. */
+  async changePassword(
+    userId: string,
+    currentPassword: string,
+    newPassword: string,
+  ): Promise<{ ok: boolean; error?: string }> {
+    const user = await this.users.findById(userId);
+    if (!user) return { ok: false, error: "User not found." };
+    if (!verifyPassword(currentPassword, user.passwordHash)) {
+      return { ok: false, error: "Current password is incorrect." };
+    }
+    await this.users.updatePassword(userId, newPassword);
+    return { ok: true };
+  }
+
+  /** Admin override: set a user's password without knowing the current one. */
+  async adminResetPassword(userId: string, newPassword: string): Promise<boolean> {
+    return this.users.updatePassword(userId, newPassword);
+  }
+
   private payload(sub: string, email: string, role: Role) {
     return { sub, email, role };
   }

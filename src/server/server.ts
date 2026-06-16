@@ -4,7 +4,17 @@ import type { MarketHub } from "../core/hub.js";
 import { INSTRUMENTS, SYMBOLS } from "../instruments.js";
 import type { AuthService } from "../auth/service.js";
 import { bearerToken, verifyToken } from "../auth/jwt.js";
-import { useDatabase } from "../config.js";
+import { config, useDatabase } from "../config.js";
+import {
+  byoConfigured,
+  clearUserDatabentoKey,
+  getUserDatabentoKey,
+  hasUserDatabentoKey,
+  setUserDatabentoKey,
+  validateDatabentoKey,
+} from "../market-data/byo-repository.js";
+import { fetchUserHistory, fetchUserQuote } from "../market-data/byo-data.js";
+import { byoSessions } from "../market-data/byo-session.js";
 import {
   createEvaluationAccount,
   getAccountDetail,
@@ -22,6 +32,8 @@ import {
   adminGetTraderDetail,
   adminListAccounts,
   adminListActivity,
+  adminListClosedPositions,
+  adminListOpenPositions,
   adminListRules,
   adminListTraders,
   adminListViolations,
@@ -120,6 +132,20 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/auth/me" && req.method === "GET") {
     return void handleMe(req, res, opts.auth);
   }
+  if (url.pathname === "/api/auth/change-password" && req.method === "POST") {
+    return void handleChangePassword(req, res, opts.auth);
+  }
+
+  // --- Market-data connection (Model B / byo: each user's own Databento key) ---
+  if (url.pathname === "/api/market-data/connection" && req.method === "GET") {
+    return void handleByoConnectionStatus(req, res);
+  }
+  if (url.pathname === "/api/market-data/connection" && req.method === "POST") {
+    return void handleByoConnect(req, res);
+  }
+  if (url.pathname === "/api/market-data/connection" && req.method === "DELETE") {
+    return void handleByoDisconnect(req, res);
+  }
 
   // --- Trading (authenticated, DB-backed) ---
   if (url.pathname === "/api/positions" && req.method === "GET") {
@@ -157,9 +183,13 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/admin/accounts" && req.method === "GET") return void handleAdmin(req, res, adminListAccounts);
   if (url.pathname === "/api/admin/activity" && req.method === "GET") return void handleAdmin(req, res, () => adminListActivity(200));
   if (url.pathname === "/api/admin/violations" && req.method === "GET") return void handleAdmin(req, res, () => adminListViolations(200));
+  if (url.pathname === "/api/admin/positions" && req.method === "GET")
+    return void handleAdmin(req, res, async () => ({ open: await adminListOpenPositions(), closed: await adminListClosedPositions(500) }));
   if (url.pathname === "/api/admin/rules" && req.method === "GET") return void handleAdmin(req, res, adminListRules);
   if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return void handleAdminStatus(url, req, res, opts.accountStream, "trader");
+  if (/^\/api\/admin\/traders\/[^/]+\/password$/.test(url.pathname) && req.method === "POST")
+    return void handleAdminResetPassword(url, req, res, opts.auth);
   if (/^\/api\/admin\/accounts\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return void handleAdminStatus(url, req, res, opts.accountStream, "account");
   if (/^\/api\/admin\/accounts\/[^/]+\/(reset|adjust-balance|close-all|liquidate|cancel-orders)$/.test(url.pathname) && req.method === "POST")
@@ -192,7 +222,12 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
 
   if (url.pathname === "/api/history" && req.method === "GET") {
+    // Model B: serve chart history from the requesting user's OWN Databento key.
+    if (config.marketDataMode === "byo") return void handleByoHistory(url, req, res);
     return void handleHistory(url, res, hub);
+  }
+  if (url.pathname === "/api/market-data/quote" && req.method === "GET") {
+    return void handleByoQuote(url, req, res);
   }
 
   json(res, 404, { error: "not found" });
@@ -271,6 +306,18 @@ async function handleAdminStatus(url: URL, req: IncomingMessage, res: ServerResp
   const ok = kind === "trader" ? await adminSetTraderStatus(id, action) : await adminSetAccountStatus(id, action);
   if (ok) accountStream.publishAdminUpdate({ kind: `${kind}_${action}`, id }); // live-refresh admin dashboards
   json(res, ok ? 200 : 404, { ok, error: ok ? undefined : "not found or no change" });
+}
+
+/** Admin sets a new password for a trader (no current password needed). */
+async function handleAdminResetPassword(url: URL, req: IncomingMessage, res: ServerResponse, auth: AuthService) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const userId = url.pathname.split("/")[4]!; // /api/admin/traders/:id/password
+  const body = await readJson<{ newPassword?: string }>(req);
+  const newPassword = body?.newPassword ?? "";
+  if (newPassword.length < 6) return json(res, 400, { error: "New password must be at least 6 characters." });
+  const ok = await auth.adminResetPassword(userId, newPassword);
+  if (!ok) return json(res, 404, { ok: false, error: "trader not found" });
+  json(res, 200, { ok: true });
 }
 
 async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: ServerResponse, orderEngine: OrderEngine, accountStream: AccountStream) {
@@ -366,6 +413,116 @@ async function handleMe(req: IncomingMessage, res: ServerResponse, auth: AuthSer
   const user = await auth.me(token);
   if (!user) return json(res, 401, { error: "invalid or expired token" });
   json(res, 200, { user });
+}
+
+/** Resolve the authenticated user id from the bearer token, or null. */
+function authedUserId(req: IncomingMessage): string | null {
+  return verifyToken(bearerToken(req.headers.authorization) ?? "")?.sub ?? null;
+}
+
+/** Report the active market-data model + whether this user has a key connected. */
+async function handleByoConnectionStatus(req: IncomingMessage, res: ServerResponse) {
+  const mode = config.marketDataMode;
+  const userId = authedUserId(req);
+  let connected = false;
+  if (mode === "byo" && userId && useDatabase) connected = await hasUserDatabentoKey(userId).catch(() => false);
+  json(res, 200, { mode, configured: byoConfigured(), connected });
+}
+
+/** Validate + store this user's own Databento key (Model B). */
+async function handleByoConnect(req: IncomingMessage, res: ServerResponse) {
+  const userId = authedUserId(req);
+  if (!userId) return json(res, 401, { error: "Not authenticated." });
+  if (!useDatabase) return json(res, 400, { error: "Connecting an account requires the database." });
+  if (!byoConfigured()) return json(res, 400, { error: "Server is not configured for per-user keys (MARKET_DATA_ENC_KEY unset)." });
+  const body = await readJson<{ apiKey?: string }>(req);
+  const apiKey = (body?.apiKey ?? "").trim();
+  if (!apiKey) return json(res, 400, { error: "A Databento API key is required." });
+  if (!(await validateDatabentoKey(apiKey))) {
+    return json(res, 400, { error: "Databento rejected that API key. Check it and try again." });
+  }
+  await setUserDatabentoKey(userId, apiKey);
+  byoSessions.drop(userId); // a replaced key must start a fresh Live session
+  json(res, 200, { ok: true, connected: true });
+}
+
+/** Disconnect (remove) this user's stored Databento key. */
+async function handleByoDisconnect(req: IncomingMessage, res: ServerResponse) {
+  const userId = authedUserId(req);
+  if (!userId) return json(res, 401, { error: "Not authenticated." });
+  if (!useDatabase) return json(res, 400, { error: "Disconnecting requires the database." });
+  await clearUserDatabentoKey(userId);
+  byoSessions.drop(userId); // tear down their Live session
+  json(res, 200, { ok: true, connected: false });
+}
+
+/** Resolve the caller's user id + own Databento key, or send the right gate/error
+ *  response. Returns { userId, key }, or null after having written a response. */
+async function requireUserKey(req: IncomingMessage, res: ServerResponse): Promise<{ userId: string; key: string } | null> {
+  const userId = authedUserId(req);
+  if (!userId) {
+    json(res, 401, { error: "Not authenticated." });
+    return null;
+  }
+  const key = await getUserDatabentoKey(userId).catch(() => null);
+  if (!key) {
+    // 412 + a stable code so the frontend can show the "Connect Databento" gate.
+    json(res, 412, { error: "No Databento account connected.", code: "no_databento_key" });
+    return null;
+  }
+  return { userId, key };
+}
+
+/** Model B: real-time chart history from the user's own Databento Live session. */
+async function handleByoHistory(url: URL, req: IncomingMessage, res: ServerResponse) {
+  const symbol = url.searchParams.get("symbol");
+  const resolution = Number(url.searchParams.get("resolution") ?? "60");
+  const count = Math.min(Number(url.searchParams.get("count") ?? "240"), 1000);
+  if (!symbol || !SYMBOLS.includes(symbol)) return json(res, 400, { error: "invalid or missing symbol" });
+  if (!Number.isFinite(resolution) || resolution <= 0) return json(res, 400, { error: "invalid resolution" });
+  const auth = await requireUserKey(req, res);
+  if (!auth) return;
+  try {
+    json(res, 200, await fetchUserHistory(auth.userId, auth.key, symbol, resolution, count));
+  } catch (err) {
+    console.error("[byo history] error:", (err as Error).message);
+    json(res, 502, { error: "history fetch failed (check your Databento entitlements)" });
+  }
+}
+
+/** Model B: latest real-time quote for a symbol from the user's own Live session. */
+async function handleByoQuote(url: URL, req: IncomingMessage, res: ServerResponse) {
+  const symbol = url.searchParams.get("symbol");
+  if (!symbol || !SYMBOLS.includes(symbol)) return json(res, 400, { error: "invalid or missing symbol" });
+  const auth = await requireUserKey(req, res);
+  if (!auth) return;
+  try {
+    const quote = fetchUserQuote(auth.userId, auth.key, symbol);
+    // 204: session is warming up (no trade received yet) — the next poll will have it.
+    if (!quote) return json(res, 204, {});
+    json(res, 200, quote);
+  } catch (err) {
+    console.error("[byo quote] error:", (err as Error).message);
+    json(res, 502, { error: "quote fetch failed (check your Databento entitlements)" });
+  }
+}
+
+/** Self-service password change for the authenticated user (any role). */
+async function handleChangePassword(req: IncomingMessage, res: ServerResponse, auth: AuthService) {
+  const payload = verifyToken(bearerToken(req.headers.authorization) ?? "");
+  if (!payload) return json(res, 401, { error: "Not authenticated." });
+  const body = await readJson<{ currentPassword?: string; newPassword?: string }>(req);
+  const currentPassword = body?.currentPassword ?? "";
+  const newPassword = body?.newPassword ?? "";
+  if (!currentPassword || !newPassword) {
+    return json(res, 400, { error: "Current and new password are required." });
+  }
+  if (newPassword.length < 6) {
+    return json(res, 400, { error: "New password must be at least 6 characters." });
+  }
+  const result = await auth.changePassword(payload.sub, currentPassword, newPassword);
+  if (!result.ok) return json(res, 400, { error: result.error ?? "Could not change password." });
+  json(res, 200, { ok: true });
 }
 
 /** Resolve the caller's account id from the bearer token, or null if unauthorized. */
