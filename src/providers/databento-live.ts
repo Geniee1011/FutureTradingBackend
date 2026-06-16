@@ -134,8 +134,15 @@ export class DatabentoLiveProvider extends BaseProvider {
         const id = map[inst.databentoSymbol];
         if (id) this.idToSymbol.set(id, inst.symbol);
       }
+      if (this.idToSymbol.size > 0) {
+        // The decisive line: once this prints, incoming live trades map to symbols
+        // and the chart/quote stream in real time. Its ABSENCE means real-time is
+        // broken at the symbology step (id map empty → every trade dropped).
+        console.log(`[live] resolved ${this.idToSymbol.size} instrument ids — live trades now stream in real time`);
+        return;
+      }
     } catch (err) {
-      this.logError(err);
+      this.logError(err, "symbology resolve (instrument-id map)");
     }
     if (this.idToSymbol.size === 0 && this.running && attempt < 8) {
       const delay = Math.min(2000 * 2 ** attempt, 30_000);
@@ -310,7 +317,7 @@ export class DatabentoLiveProvider extends BaseProvider {
             this.emitQuote(inst.symbol, st); // refresh change/high/low even without a trade
           }
         } catch (err) {
-          this.logError(err);
+          this.logError(err, `24h-stats ${inst.symbol} (cosmetic — does not affect live price)`);
         }
       }),
     );
@@ -350,13 +357,14 @@ export class DatabentoLiveProvider extends BaseProvider {
     });
   }
 
-  private logError(err: unknown): void {
+  private logError(err: unknown, context?: string): void {
     const now = Date.now();
     if (this.failing && now - this.lastErrorLogAt < 30_000) return;
     this.failing = true;
     this.lastErrorLogAt = now;
     const e = err as { message?: string; cause?: { code?: string } };
-    console.warn(`[live] ${e?.cause?.code ?? e?.message ?? "request failed"}`);
+    const detail = e?.cause?.code ?? e?.message ?? "request failed";
+    console.warn(`[live] ${context ? `${context}: ` : ""}${detail}`);
   }
 
   private logRecovered(): void {
