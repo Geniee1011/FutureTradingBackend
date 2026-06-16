@@ -38,6 +38,17 @@ export const config = {
   /** Secret used to encrypt each user's Databento key at rest (Model B / byo).
    *  Any long random string; required only when MARKET_DATA_MODE=byo. */
   marketDataEncKey: process.env.MARKET_DATA_ENC_KEY?.trim() ?? "",
+
+  /** Bootstrap admin (optional). When both are set, the backend ensures an ADMIN
+   *  user with this email exists on startup — creating it, or promoting an
+   *  existing user of that email to ADMIN. Lets you provision an admin on a fresh
+   *  deploy without the seed/CLI. */
+  adminEmail: process.env.ADMIN_EMAIL?.trim() ?? "",
+  adminPassword: process.env.ADMIN_PASSWORD ?? "",
+
+  /** Auto-seed demo data on a fresh (empty) database at boot. Opt-in because the
+   *  seed creates well-known demo credentials — DO NOT enable in production. */
+  seedDemo: process.env.SEED_DEMO === "1",
 } as const;
 
 if (config.jwt.secret === "dev-insecure-secret-change-me") {

@@ -1,8 +1,10 @@
 import "dotenv/config";
+import { pathToFileURL } from "node:url";
 import { WebSocket } from "ws";
 import { getPool, closePool } from "./pool.js";
 import { hashPassword } from "../auth/password.js";
 import { getInstrument } from "../instruments.js";
+import { config } from "../config.js";
 
 /* Seeds demo users + an evaluation account/rule for the trader.
    Idempotent (upserts on unique keys). Run via `npm run db:seed`. */
@@ -66,11 +68,9 @@ async function fetchLiveMarks(symbols: readonly string[]): Promise<Record<string
   return marks;
 }
 
-async function main() {
-  if (!process.env.DATABASE_URL) {
-    console.error("DATABASE_URL is not set — nothing to seed.");
-    process.exit(1);
-  }
+/** Seed demo users + a populated evaluation account. Uses the shared pool and
+ *  does NOT close it — the caller manages the pool lifecycle. */
+export async function runSeed(): Promise<void> {
   const pool = getPool();
 
   for (const u of USERS) {
@@ -221,11 +221,34 @@ async function main() {
 
   const { rows: count } = await pool.query<{ n: string }>(`SELECT count(*)::text AS n FROM "User"`);
   console.log(`✓ Seeded users + evaluation account. "User" table now has ${count[0]!.n} rows.`);
+}
+
+/** Auto-seed a FRESH database on boot — only when SEED_DEMO=1 and no accounts
+ *  exist yet. Opt-in (a flag, not just emptiness) so a production deploy never
+ *  gets the weak demo credentials by accident; never overwrites existing data. */
+export async function seedIfEmpty(): Promise<void> {
+  if (!config.seedDemo) return;
+  const { rows } = await getPool().query<{ n: string }>(`SELECT count(*)::text AS n FROM "Account"`);
+  if (Number(rows[0]?.n ?? "0") > 0) return; // already initialised — leave it alone
+  console.log("[seed] empty database + SEED_DEMO=1 → seeding demo data…");
+  await runSeed();
+}
+
+// CLI entry (`npm run db:seed`). Guarded so importing this module (for the boot
+// seedIfEmpty guard) does NOT trigger a seed — only direct invocation does.
+async function main() {
+  if (!process.env.DATABASE_URL) {
+    console.error("DATABASE_URL is not set — nothing to seed.");
+    process.exit(1);
+  }
+  await runSeed();
   await closePool();
 }
 
-main().catch(async (err) => {
-  console.error("Seed failed:", err.message);
-  await closePool();
-  process.exit(1);
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch(async (err) => {
+    console.error("Seed failed:", err.message);
+    await closePool();
+    process.exit(1);
+  });
+}

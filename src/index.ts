@@ -1,4 +1,4 @@
-import { config, useDatabento } from "./config.js";
+import { config, useDatabento, useDatabase } from "./config.js";
 import { MarketHub } from "./core/hub.js";
 import { createMarketServer } from "./server/server.js";
 import { SimulationProvider } from "./providers/simulation.js";
@@ -9,6 +9,8 @@ import { INSTRUMENTS, SYMBOLS } from "./instruments.js";
 import { computeContractCode } from "./contract-code.js";
 import { AuthService } from "./auth/service.js";
 import { createUserStore } from "./auth/store-factory.js";
+import { ensureBootstrapAdmin } from "./auth/bootstrap-admin.js";
+import { seedIfEmpty } from "./db/seed.js";
 import { AccountStream } from "./realtime/account-stream.js";
 import { OrderEngine } from "./trading/order-engine.js";
 import { RiskEngine } from "./trading/risk-engine.js";
@@ -45,6 +47,11 @@ function buildProvider(): MarketDataProvider {
 
 // Auth. Postgres-backed (PgUserStore) when DATABASE_URL is set, else in-memory.
 const auth = new AuthService(createUserStore());
+
+// Provision an admin from ADMIN_EMAIL/ADMIN_PASSWORD if set (no seed/CLI needed).
+if (useDatabase) {
+  void ensureBootstrapAdmin().catch((e) => console.error("[admin] bootstrap failed:", (e as Error).message));
+}
 
 const provider = buildProvider();
 const hub = new MarketHub(provider);
@@ -111,6 +118,12 @@ server.listen(config.port, () => {
   console.log(`  Auth         POST http://localhost:${config.port}/api/auth/login  ·  GET /api/auth/me`);
   console.log(`  Health       http://localhost:${config.port}/health`);
   console.log(`  Symbols      ${SYMBOLS.join(", ")}`);
+
+  // Auto-seed demo data on a fresh DB (SEED_DEMO=1 only). Runs after the server
+  // is listening so the seed's live-mark fetch (own WS) can connect.
+  if (useDatabase) {
+    void seedIfEmpty().catch((e) => console.error("[seed] auto-seed failed:", (e as Error).message));
+  }
 });
 
 function shutdown() {
