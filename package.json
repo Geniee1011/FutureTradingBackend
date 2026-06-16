@@ -17,6 +17,7 @@
     "dotenv": "^16.4.7",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.21.0",
+    "tsx": "^4.19.2",
     "ws": "^8.18.0"
   },
   "devDependencies": {
@@ -25,7 +26,6 @@
     "@types/pg": "^8.20.0",
     "@types/ws": "^8.5.13",
     "prisma": "^6.19.3",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.2"
   }
 }
