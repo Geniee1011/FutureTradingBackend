@@ -2,7 +2,7 @@ import net from "node:net";
 import { createHash } from "node:crypto";
 import { BaseProvider, round } from "./provider.js";
 import { DatabentoClient } from "../databento/client.js";
-import { DbnDecoder, type DecodedBook, type DecodedRecord, type DecodedTrade } from "../databento/dbn.js";
+import { DbnDecoder, type DecodedBook, type DecodedMapping, type DecodedRecord, type DecodedTrade } from "../databento/dbn.js";
 import { aggregateCandles, fetchDailyStats, fetchHistory } from "./databento-shared.js";
 import { INSTRUMENTS, getInstrument } from "../instruments.js";
 import type { Candle } from "../types.js";
@@ -50,6 +50,8 @@ export class DatabentoLiveProvider extends BaseProvider {
   private decoder = new DbnDecoder();
   private state = new Map<string, SymState>();
   private idToSymbol = new Map<number, string>();
+  private readonly dbSymToSymbol = new Map<string, string>(); // databentoSymbol → internal symbol
+  private unmappedIds = new Set<number>(); // live ids we received trades for but couldn't map (diagnostic)
   private bookEmitAt = new Map<string, number>(); // per-symbol throttle clock
   private liveBars = new Map<string, Candle[]>(); // 1-min bars built from live trades
   // Historical-backfill cache, keyed `${symbol}:${resolutionSec}`. The Historical
@@ -79,6 +81,7 @@ export class DatabentoLiveProvider extends BaseProvider {
       this.state.set(inst.symbol, {
         price: inst.simBase, priceTs: 0, dayOpen: 0, high: 0, low: 0, volume: 0, havePrice: false, haveStats: false,
       });
+      this.dbSymToSymbol.set(inst.databentoSymbol, inst.symbol);
     }
   }
 
@@ -291,17 +294,46 @@ export class DatabentoLiveProvider extends BaseProvider {
     // since the gateway can ack then immediately close (see entitlement loop).
     if (this.retries) this.retries = 0;
     if (r.kind === "trade") this.onTrade(r);
-    else this.onBook(r);
+    else if (r.kind === "book") this.onBook(r);
+    else this.onMapping(r);
+  }
+
+  /** Bind a LIVE instrument_id to one of our symbols from a gateway mapping record. */
+  private onMapping(m: DecodedMapping): void {
+    // The body holds the subscribed symbol(s) as null-padded C strings (e.g.
+    // "ES.v.0"). Tokenize and match EXACTLY against our known databento symbols —
+    // exact match avoids "ES.v.0" wrongly matching inside "MES.v.0".
+    for (const token of m.symbolText.match(/[A-Za-z0-9._-]+/g) ?? []) {
+      const symbol = this.dbSymToSymbol.get(token);
+      if (!symbol) continue;
+      if (this.idToSymbol.get(m.instrumentId) !== symbol) {
+        this.idToSymbol.set(m.instrumentId, symbol);
+        this.unmappedIds.delete(m.instrumentId);
+        console.log(`[live] mapped live instrument ${m.instrumentId} → ${symbol} (${token})`);
+      }
+      return;
+    }
   }
 
   private onTrade(t: DecodedTrade): void {
     const symbol = this.idToSymbol.get(t.instrumentId);
-    if (!symbol) return;
+    if (!symbol) {
+      // Trades ARE arriving but their live id isn't in our map — log the first
+      // few distinct ids so this exact failure is visible (vs. "no trades at
+      // all"). The mapping records above should populate the map and clear this.
+      if (this.unmappedIds.size < 12 && !this.unmappedIds.has(t.instrumentId)) {
+        this.unmappedIds.add(t.instrumentId);
+        console.warn(`[live] trade for unmapped instrument ${t.instrumentId} (have ${this.idToSymbol.size} mappings) — dropped`);
+      }
+      return;
+    }
     const st = this.state.get(symbol);
     if (!st) return;
+    const firstForSymbol = !st.havePrice;
     st.price = t.price;
     st.priceTs = t.ts;
     st.havePrice = true;
+    if (firstForSymbol) console.log(`[live] first live trade ${symbol} @ ${t.price}`);
     if (st.haveStats) {
       st.high = Math.max(st.high, t.price);
       st.low = Math.min(st.low, t.price);

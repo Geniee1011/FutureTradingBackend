@@ -7,14 +7,17 @@
    - `mbp-10` records (rtype 0x0a): a full top-10 book snapshot — 10 BidAskPair
      levels (bid_px/ask_px int64, bid_sz/ask_sz uint32) starting at offset 48
 
-   All other record types (symbol mapping, system/heartbeat, error) are skipped
-   by their length, so the decoder is robust across DBN versions — these field
-   offsets are stable across v1/v2/v3.
+   - `symbol mapping` records (rtype 0x16): the live gateway's authoritative
+     instrument_id ↔ subscribed-symbol binding (emitted at session start / rolls)
+   All other record types (system/heartbeat, error) are skipped by their length,
+   so the decoder is robust across DBN versions — these field offsets are stable
+   across v1/v2/v3.
 
    feed() is partial-safe: it buffers across chunks and only emits complete records. */
 
 const RTYPE_TRADE = 0x00;
 const RTYPE_MBP10 = 0x0a;
+const RTYPE_SYMBOL_MAPPING = 0x16; // live gateway → instrument_id ↔ subscribed symbol
 const HEADER_BYTES = 16;
 const PRICE_SCALE = 1e9;
 const UNDEF_PRICE = 9223372036854775807n; // INT64_MAX sentinel = no price at this level
@@ -48,7 +51,13 @@ export interface DecodedBook {
   ts: number; // epoch ms
 }
 
-export type DecodedRecord = DecodedTrade | DecodedBook;
+export interface DecodedMapping {
+  kind: "mapping";
+  instrumentId: number;
+  symbolText: string; // printable ASCII of the symbol region; caller matches its known symbols
+}
+
+export type DecodedRecord = DecodedTrade | DecodedBook | DecodedMapping;
 
 export class DbnDecoder {
   private buf: Buffer = Buffer.alloc(0);
@@ -97,6 +106,18 @@ export class DbnDecoder {
         });
       } else if (rtype === RTYPE_MBP10 && recBytes >= MBP10_MIN_BYTES) {
         out.push(decodeMbp10(this.buf));
+      } else if (rtype === RTYPE_SYMBOL_MAPPING) {
+        // The gateway emits these at session start (and on rolls): they bind the
+        // LIVE instrument_id to the symbol we subscribed by. The exact field
+        // offsets shift across DBN versions, so we hand the caller the printable
+        // ASCII of the record body and let it match the symbols it knows — robust
+        // without version-specific struct math. This is the authoritative live
+        // id→symbol map (the Historical symbology resolve can disagree on rolls).
+        out.push({
+          kind: "mapping",
+          instrumentId: this.buf.readUInt32LE(4),
+          symbolText: this.buf.subarray(HEADER_BYTES, recBytes).toString("latin1"),
+        });
       }
       this.buf = this.buf.subarray(recBytes);
     }
