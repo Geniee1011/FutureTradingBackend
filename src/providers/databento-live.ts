@@ -29,6 +29,7 @@ const BOOK_THROTTLE_MS = 150;
 // We aggregate live trade prints into 1-minute bars and merge them into
 // getHistory, closing that seam — and the buffer survives frontend reloads.
 const LIVE_BAR_CAP = 1500; // ~25h of 1-minute bars per symbol
+const HIST_CACHE_TTL_MS = 60_000; // re-fetch a symbol's historical backfill at most once/min
 
 interface SymState {
   price: number;
@@ -51,6 +52,12 @@ export class DatabentoLiveProvider extends BaseProvider {
   private idToSymbol = new Map<number, string>();
   private bookEmitAt = new Map<string, number>(); // per-symbol throttle clock
   private liveBars = new Map<string, Candle[]>(); // 1-min bars built from live trades
+  // Historical-backfill cache, keyed `${symbol}:${resolutionSec}`. The Historical
+  // HTTP hop is slow/rate-limited from some hosts (e.g. Railway), so we fetch it
+  // ONCE in the background, cache it, and serve it instantly thereafter — the
+  // chart never waits on (or is blanked by) a slow historical request.
+  private histCache = new Map<string, { at: number; bars: Candle[] }>();
+  private histInflight = new Set<string>();
   private streaming = false;
   private textBuf: Buffer = Buffer.alloc(0);
   private running = false;
@@ -96,16 +103,16 @@ export class DatabentoLiveProvider extends BaseProvider {
   async getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]> {
     const inst = getInstrument(symbol);
     if (!inst) return [];
-    let hist: Candle[] = [];
-    try {
-      hist = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision);
-    } catch (err) {
-      // Historical HTTP timed out (slow hop to Databento). Don't blank the chart —
-      // fall through to the live-built bar buffer so it still renders (it just
-      // starts at session-connect time instead of `count` bars back). Deep history
-      // returns once the HTTP hop is fast enough (move the host to a US region).
-      this.logError(err, `history ${symbol} (chart backfill — falling back to live bars)`);
+    const key = `${symbol}:${resolutionSec}`;
+    const cached = this.histCache.get(key);
+    // Warm (or refresh) the cache in the BACKGROUND — never block the chart
+    // response on the slow Historical hop. The first call returns live-only; once
+    // the background fetch lands, subsequent calls (the frontend re-polls) serve
+    // full history. TTL 60s keeps it fresh without hammering the link.
+    if (!cached || Date.now() - cached.at > HIST_CACHE_TTL_MS) {
+      void this.refreshHistory(symbol, resolutionSec, count, inst);
     }
+    const hist = cached?.bars ?? [];
     // The live buffer is minute-grained, so it can only extend resolutions >= 1m.
     const live = this.liveBars.get(symbol);
     if (resolutionSec < 60 || !live || live.length === 0) return hist;
@@ -114,6 +121,33 @@ export class DatabentoLiveProvider extends BaseProvider {
     const lastHist = hist.length ? hist[hist.length - 1]!.time : 0;
     const tail = aggregateCandles(live, resolutionSec).filter((c) => c.time > lastHist);
     return tail.length ? [...hist, ...tail].slice(-count) : hist;
+  }
+
+  /**
+   * Populate the historical-backfill cache for one symbol/resolution. Runs in the
+   * background (callers don't await it), de-duped per key, with a generous timeout
+   * — a slow Historical hop is acceptable here because it doesn't block the chart;
+   * it just needs to land once, after which the cache serves it instantly.
+   */
+  private async refreshHistory(symbol: string, resolutionSec: number, count: number, inst: ReturnType<typeof getInstrument>): Promise<void> {
+    if (!inst) return;
+    const key = `${symbol}:${resolutionSec}`;
+    if (this.histInflight.has(key)) return;
+    this.histInflight.add(key);
+    try {
+      const bars = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision, {
+        retries: 1,
+        timeoutMs: 60_000,
+      });
+      if (bars.length) {
+        this.histCache.set(key, { at: Date.now(), bars });
+        this.logRecovered();
+      }
+    } catch (err) {
+      this.logError(err, `history ${symbol} ${resolutionSec}s (background backfill — chart shows live bars meanwhile)`);
+    } finally {
+      this.histInflight.delete(key);
+    }
   }
 
   /** Resolve each root's current dated contract code (e.g. ES → ESM6). */

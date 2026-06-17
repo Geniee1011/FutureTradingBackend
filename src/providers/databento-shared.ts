@@ -27,12 +27,18 @@ export async function fetchHistory(
   resolutionSec: number,
   count: number,
   precision: number,
+  opts?: { retries?: number; timeoutMs?: number },
 ): Promise<Candle[]> {
   const startMs = Date.now() - count * resolutionSec * 1000 - GAP_PAD_MS;
   const native = NATIVE_SCHEMA[resolutionSec];
   // Heavy historical fetches need the longer budget — the default 10s/1-retry
   // isn't enough for Databento's cold-start latency (was silently timing out).
-  const histOpts = { retries: HISTORY_RETRIES, timeoutMs: HISTORY_TIMEOUT_MS };
+  // Callers warming a background cache pass an even longer timeout (slow hop is
+  // fine when it doesn't block the chart response).
+  const histOpts = {
+    retries: opts?.retries ?? HISTORY_RETRIES,
+    timeoutMs: opts?.timeoutMs ?? HISTORY_TIMEOUT_MS,
+  };
   if (native) {
     const bars = await client.ohlcv(dbSymbol, native, startMs, Date.now(), undefined, histOpts);
     return bars.slice(-count).map((b) => toCandle(b, precision));
