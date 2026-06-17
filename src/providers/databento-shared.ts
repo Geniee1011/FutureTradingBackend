@@ -57,8 +57,12 @@ export interface DailyStats {
  * 24 *trading* hours (the last session) instead of an empty window.
  */
 export async function fetchDailyStats(client: DatabentoClient, dbSymbol: string): Promise<DailyStats | null> {
+  // No retries here: this is the cosmetic 24h-stats poll, re-run every 30s, so a
+  // failed attempt self-heals on the next tick. Retrying 3× per symbol just piles
+  // more load onto the rate/bandwidth-limited Historical link and starves the
+  // user-facing chart-history fetch (which keeps its retries).
   const bars = await client.ohlcv(dbSymbol, "ohlcv-1h", Date.now() - 5 * 24 * 3600_000, Date.now(), undefined, {
-    retries: HISTORY_RETRIES,
+    retries: 0,
     timeoutMs: HISTORY_TIMEOUT_MS,
   });
   const window = bars.slice(-24);

@@ -96,7 +96,16 @@ export class DatabentoLiveProvider extends BaseProvider {
   async getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]> {
     const inst = getInstrument(symbol);
     if (!inst) return [];
-    const hist = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision);
+    let hist: Candle[] = [];
+    try {
+      hist = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision);
+    } catch (err) {
+      // Historical HTTP timed out (slow hop to Databento). Don't blank the chart —
+      // fall through to the live-built bar buffer so it still renders (it just
+      // starts at session-connect time instead of `count` bars back). Deep history
+      // returns once the HTTP hop is fast enough (move the host to a US region).
+      this.logError(err, `history ${symbol} (chart backfill — falling back to live bars)`);
+    }
     // The live buffer is minute-grained, so it can only extend resolutions >= 1m.
     const live = this.liveBars.get(symbol);
     if (resolutionSec < 60 || !live || live.length === 0) return hist;
@@ -302,8 +311,15 @@ export class DatabentoLiveProvider extends BaseProvider {
   }
 
   private async pollDaily(): Promise<void> {
-    await Promise.all(
-      INSTRUMENTS.map(async (inst) => {
+    // Small worker pool, NOT 10-at-once: on a high-latency hop to Databento, ten
+    // concurrent historical fetches saturate the link and starve the on-demand
+    // chart-history request (which the user is actually waiting on). Cap to 3 so
+    // there's always headroom for getHistory.
+    const queue = [...INSTRUMENTS];
+    const worker = async () => {
+      for (;;) {
+        const inst = queue.shift();
+        if (!inst) return;
         const st = this.state.get(inst.symbol)!;
         try {
           const stats = await fetchDailyStats(this.client, inst.databentoSymbol);
@@ -319,8 +335,9 @@ export class DatabentoLiveProvider extends BaseProvider {
         } catch (err) {
           this.logError(err, `24h-stats ${inst.symbol} (cosmetic — does not affect live price)`);
         }
-      }),
-    );
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
   }
 
   private emitQuote(symbol: string, st: SymState, lastSize = 0): void {
