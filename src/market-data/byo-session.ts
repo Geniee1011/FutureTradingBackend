@@ -20,12 +20,24 @@ interface Session {
 class ByoSessionManager {
   private sessions = new Map<string, Session>();
   private reaper: NodeJS.Timeout | null = null;
+  private markSink: ((symbol: string, price: number) => void) | null = null;
+
+  /**
+   * Register a sink that receives every live quote from every user's session, so
+   * the execution engine has real marks in byo mode (it otherwise streams nothing
+   * shared). A symbol's price is identical across users, so one global sink is fine.
+   */
+  setMarkSink(sink: (symbol: string, price: number) => void): void {
+    this.markSink = sink;
+  }
 
   /** Get (or lazily start) a user's Live session and mark it active. */
   private ensure(userId: string, apiKey: string): DatabentoLiveProvider {
     let s = this.sessions.get(userId);
     if (!s) {
       const provider = new DatabentoLiveProvider(apiKey, config.databento.dataset);
+      // Forward this user's live prices to the shared mark sink (order fills + P&L).
+      provider.on("quote", (q) => this.markSink?.(q.symbol, q.price));
       provider.start();
       s = { provider, lastUsed: Date.now() };
       this.sessions.set(userId, s);

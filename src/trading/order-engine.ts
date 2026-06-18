@@ -105,7 +105,7 @@ export class OrderEngine {
       const acc = rule.rows[0];
       if (acc?.status && acc.status !== "ACTIVE") {
         await client.query("ROLLBACK");
-        return { ok: false, error: `Account is ${acc.status} — trading is disabled.` };
+        return { ok: false, error: await disabledAccountMessage(accountId, acc.status) };
       }
       if (acc?.allowedInstruments?.length && !acc.allowedInstruments.includes(input.symbol)) {
         const detail = `${input.symbol} is not allowed on this account.`;
@@ -584,6 +584,31 @@ export class OrderEngine {
     await client.query(`INSERT INTO "Violation" ("accountId","type","action","detail") VALUES ($1,$2,'REJECT_ORDER',$3)`, [accountId, type, detail]);
     await this.log(client, accountId, "ORDER_REJECTED", detail);
   }
+}
+
+/**
+ * Build a specific "trading disabled" message for a non-ACTIVE account — includes
+ * the actual breach (e.g. "Drawdown $3,034 reached limit $3,000") so the trader
+ * understands WHY, instead of a bare "Account is FAILED".
+ */
+async function disabledAccountMessage(accountId: string, status: string): Promise<string> {
+  let detail: string | null = null;
+  try {
+    const v = await getPool().query<{ detail: string }>(
+      `SELECT "detail" FROM "Violation" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 1`,
+      [accountId],
+    );
+    detail = v.rows[0]?.detail ?? null;
+  } catch {
+    /* fall back to the generic message */
+  }
+  if (status === "FAILED") {
+    return detail
+      ? `Account failed evaluation — ${detail}. Trading is disabled; contact your administrator to reset.`
+      : "Account failed evaluation — trading is disabled; contact your administrator to reset.";
+  }
+  if (status === "PASSED") return "Account has passed the evaluation — trading is closed.";
+  return `Account is ${status.toLowerCase()} — trading is disabled.`;
 }
 
 /**

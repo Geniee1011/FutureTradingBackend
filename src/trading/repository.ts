@@ -178,6 +178,7 @@ export interface AccountSnapshot {
   startingBalance: number;
   realizedPnlToday: number;
   status: string;
+  statusReason: string | null; // why a non-ACTIVE account is in that state (the breach detail)
   dayStartEquity: number; // equity at the start of the current trading day
 }
 
@@ -188,11 +189,22 @@ export async function getAccountSnapshot(accountId: string): Promise<AccountSnap
   );
   const r = rows[0];
   if (!r) return null;
+  // For a non-ACTIVE account, surface the specific breach (e.g. "Drawdown $3,034
+  // reached limit $3,000") so the UI can tell the trader exactly what happened.
+  let statusReason: string | null = null;
+  if (r.status !== "ACTIVE") {
+    const v = await getPool().query(
+      `SELECT "detail" FROM "Violation" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 1`,
+      [accountId],
+    );
+    statusReason = (v.rows[0]?.detail as string | undefined) ?? null;
+  }
   return {
     balance: Number(r.balance),
     startingBalance: Number(r.startingBalance),
     realizedPnlToday: Number(r.dailyPnl),
     status: r.status,
+    statusReason,
     dayStartEquity: r.dayStartEquity != null ? Number(r.dayStartEquity) : Number(r.startingBalance),
   };
 }
@@ -246,28 +258,35 @@ export interface ApiOrder {
   createdAt: number;
   updatedAt: number;
   reason?: string;
+  bracketRole?: "SL" | "TP"; // set when this order is a bracket exit leg (stop=SL, limit=TP)
 }
 
 export async function listOrders(accountId: string): Promise<ApiOrder[]> {
   const { rows } = await getPool().query(
     `SELECT "id","symbol","side","type","status","quantity","filledQuantity",
-            "requestedPrice","fillPrice","reason","createdAt","updatedAt"
+            "requestedPrice","fillPrice","reason","ocoGroupId","createdAt","updatedAt"
      FROM "Order" WHERE "accountId" = $1 ORDER BY "createdAt" DESC`,
     [accountId],
   );
-  return rows.map((r) => ({
-    id: r.id,
-    symbol: r.symbol,
-    side: (r.side as string).toLowerCase() as "buy" | "sell",
-    type: r.type === "STOP_LIMIT" ? "stop" : ((r.type as string).toLowerCase() as "market" | "limit" | "stop"),
-    status: ORDER_STATUS[r.status] ?? "open",
-    quantity: Number(r.quantity),
-    filledQuantity: Number(r.filledQuantity),
-    price: r.requestedPrice != null ? Number(r.requestedPrice) : null,
-    avgFillPrice: r.fillPrice != null ? Number(r.fillPrice) : null,
-    timeInForce: "GTC",
-    createdAt: new Date(r.createdAt).getTime(),
-    updatedAt: new Date(r.updatedAt).getTime(),
-    reason: r.reason ?? undefined,
-  }));
+  return rows.map((r) => {
+    const type = r.type === "STOP_LIMIT" ? "stop" : ((r.type as string).toLowerCase() as "market" | "limit" | "stop");
+    // A bracket exit leg carries an ocoGroupId; the stop is the SL, the limit the TP.
+    const bracketRole = r.ocoGroupId ? (type === "stop" ? "SL" : type === "limit" ? "TP" : undefined) : undefined;
+    return {
+      id: r.id,
+      symbol: r.symbol,
+      side: (r.side as string).toLowerCase() as "buy" | "sell",
+      type,
+      status: ORDER_STATUS[r.status] ?? "open",
+      quantity: Number(r.quantity),
+      filledQuantity: Number(r.filledQuantity),
+      price: r.requestedPrice != null ? Number(r.requestedPrice) : null,
+      avgFillPrice: r.fillPrice != null ? Number(r.fillPrice) : null,
+      timeInForce: "GTC",
+      createdAt: new Date(r.createdAt).getTime(),
+      updatedAt: new Date(r.updatedAt).getTime(),
+      reason: r.reason ?? undefined,
+      bracketRole,
+    } satisfies ApiOrder;
+  });
 }

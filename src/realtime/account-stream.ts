@@ -169,6 +169,16 @@ export class AccountStream {
     return this.quotes.get(symbol);
   }
 
+  /**
+   * Feed a mark from an EXTERNAL source (Model B / byo per-user live sessions).
+   * In byo mode the shared provider streams nothing (no one subscribes to it),
+   * so without this the order engine has no fill price and positions never mark.
+   * A symbol's price is the same for every user, so a single global map is correct.
+   */
+  setExternalMark(symbol: string, price: number): void {
+    if (price > 0) this.quotes.set(symbol, price);
+  }
+
   private tick() {
     // Evaluate each known account against its rule once per tick, using LIVE equity
     // (cash + unrealized), and keep a trailing peak for live drawdown reporting.
@@ -236,6 +246,7 @@ export class AccountStream {
         type: "account_update",
         channel: "account-updates",
         status: acc.snapshot.status, // ACTIVE → PASSED/FAILED reflects live after a breach/target
+        statusReason: acc.snapshot.statusReason, // the specific breach detail (null when ACTIVE)
         balance: round(acc.snapshot.balance, 2),
         equity: round(equity, 2),
         unrealizedPnl: round(unrealized, 2),

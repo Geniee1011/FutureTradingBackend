@@ -11,6 +11,7 @@ import { AuthService } from "./auth/service.js";
 import { createUserStore } from "./auth/store-factory.js";
 import { ensureBootstrapAdmin } from "./auth/bootstrap-admin.js";
 import { seedIfEmpty } from "./db/seed.js";
+import { byoSessions } from "./market-data/byo-session.js";
 import { AccountStream } from "./realtime/account-stream.js";
 import { OrderEngine } from "./trading/order-engine.js";
 import { RiskEngine } from "./trading/risk-engine.js";
@@ -60,6 +61,13 @@ hub.start();
 // Real-time gateway for authenticated channels (positions/account/orders/admin).
 const accountStream = new AccountStream(provider);
 accountStream.start();
+
+// Model B: the shared provider streams nothing (no one subscribes to it), so feed
+// each user's real per-user live prices into the mark map — this is what gives the
+// execution engine fill prices for market orders and live marks for position P&L.
+if (config.marketDataMode === "byo") {
+  byoSessions.setMarkSink((symbol, price) => accountStream.setExternalMark(symbol, price));
+}
 
 // Order engine (real, Postgres-backed) — fills market orders, nets positions,
 // and runs the resting-order monitor that triggers limit/stop orders.
