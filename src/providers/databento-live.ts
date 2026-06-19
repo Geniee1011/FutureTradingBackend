@@ -24,6 +24,8 @@ const MAX_BACKOFF_MS = 15_000;
 // Coalesce book updates: mbp-10 can tick many times per millisecond on liquid
 // contracts, but the UI only needs a fresh snapshot a few times per second.
 const BOOK_THROTTLE_MS = 150;
+// How often a book (BBO) change may refresh the quote snapshot's bid/ask between trades.
+const BOOK_QUOTE_THROTTLE_MS = 400;
 // Rolling per-symbol live-bar buffer. The Historical API lags real-time (its
 // dataset-end trails by minutes/hours), so chart history stops short of "now".
 // We aggregate live trade prints into 1-minute bars and merge them into
@@ -40,6 +42,9 @@ interface SymState {
   volume: number;
   havePrice: boolean;
   haveStats: boolean;
+  bestBid: number; // real top-of-book (from mbp-1), 0 until first book message
+  bestAsk: number;
+  haveBook: boolean;
 }
 
 export class DatabentoLiveProvider extends BaseProvider {
@@ -52,7 +57,8 @@ export class DatabentoLiveProvider extends BaseProvider {
   private idToSymbol = new Map<number, string>();
   private readonly dbSymToSymbol = new Map<string, string>(); // databentoSymbol → internal symbol
   private unmappedIds = new Set<number>(); // live ids we received trades for but couldn't map (diagnostic)
-  private bookEmitAt = new Map<string, number>(); // per-symbol throttle clock
+  private bookEmitAt = new Map<string, number>(); // per-symbol throttle clock (DOM emit)
+  private quoteBookAt = new Map<string, number>(); // per-symbol throttle clock (BBO→quote refresh)
   private liveBars = new Map<string, Candle[]>(); // 1-min bars built from live trades
   // Historical-backfill cache, keyed `${symbol}:${resolutionSec}`. The Historical
   // HTTP hop is slow/rate-limited from some hosts (e.g. Railway), so we fetch it
@@ -80,6 +86,7 @@ export class DatabentoLiveProvider extends BaseProvider {
     for (const inst of INSTRUMENTS) {
       this.state.set(inst.symbol, {
         price: inst.simBase, priceTs: 0, dayOpen: 0, high: 0, low: 0, volume: 0, havePrice: false, haveStats: false,
+        bestBid: 0, bestAsk: 0, haveBook: false,
       });
       this.dbSymToSymbol.set(inst.databentoSymbol, inst.symbol);
     }
@@ -266,6 +273,12 @@ export class DatabentoLiveProvider extends BaseProvider {
       const symbols = INSTRUMENTS.map((i) => i.databentoSymbol).join(",");
       // No `start` field → live subscription from now (empty start is rejected).
       this.socket?.write(`schema=trades|stype_in=continuous|symbols=${symbols}\n`);
+      // Top-of-book (best bid/ask) for ACCURATE quotes. Without it we fabricate a
+      // symmetric ±1-tick spread (last always dead-centre), which is wrong vs the
+      // real market. Set DATABENTO_BBO=0 to disable if it ever troubles the gateway.
+      if (process.env.DATABENTO_BBO !== "0") {
+        this.socket?.write(`schema=mbp-1|stype_in=continuous|symbols=${symbols}\n`);
+      }
       // Real depth book: top-10 market-by-price. Each mbp-10 message is a full
       // top-10 snapshot, so no incremental book state has to be maintained.
       // NOTE: gated behind DATABENTO_MBP10 while we confirm whether this
@@ -276,7 +289,7 @@ export class DatabentoLiveProvider extends BaseProvider {
       this.socket?.write(`start_session=0\n`);
       this.streaming = true;
       this.logRecovered();
-      console.log("[live] authenticated — streaming trades + mbp-10 book for", INSTRUMENTS.length, "instruments");
+      console.log("[live] authenticated — streaming trades + top-of-book for", INSTRUMENTS.length, "instruments");
     } else if (line.startsWith("error=")) {
       // Unconditional — a subscription/entitlement rejection must never be
       // swallowed by the error throttle.
@@ -410,11 +423,14 @@ export class DatabentoLiveProvider extends BaseProvider {
     const inst = getInstrument(symbol)!;
     const p = inst.pricePrecision;
     const spread = inst.tickSize;
+    // Real top-of-book when we have it; otherwise fall back to a synthetic ±1-tick.
+    const bid = st.haveBook && st.bestBid > 0 ? st.bestBid : st.price - spread;
+    const ask = st.haveBook && st.bestAsk > 0 ? st.bestAsk : st.price + spread;
     this.emit("quote", {
       symbol,
       price: round(st.price, p),
-      bid: round(st.price - spread, p),
-      ask: round(st.price + spread, p),
+      bid: round(bid, p),
+      ask: round(ask, p),
       change24h: st.haveStats && st.dayOpen > 0 ? (st.price - st.dayOpen) / st.dayOpen : 0,
       high24h: round(st.haveStats ? Math.max(st.high, st.price) : st.price, p),
       low24h: round(st.haveStats ? Math.min(st.low, st.price) : st.price, p),
@@ -424,10 +440,31 @@ export class DatabentoLiveProvider extends BaseProvider {
     });
   }
 
-  /** Emit a real top-10 book from an mbp-10 snapshot, throttled and only for watched symbols. */
+  /** Handle a book message: update the real BBO for the quote, and (for watched symbols) the DOM. */
   private onBook(b: DecodedBook): void {
     const symbol = this.idToSymbol.get(b.instrumentId);
-    if (!symbol || !this.bookSymbols.has(symbol)) return;
+    if (!symbol) return;
+
+    // Real best bid/ask → drives the quote's bid/ask (replaces the synthetic spread).
+    const st = this.state.get(symbol);
+    if (st) {
+      const bid = b.bids[0]?.price;
+      const ask = b.asks[0]?.price;
+      if (bid != null && ask != null && bid > 0 && ask >= bid) {
+        st.bestBid = bid;
+        st.bestAsk = ask;
+        st.haveBook = true;
+        // Refresh the snapshot's bid/ask between trades, throttled (book is busy).
+        const t = Date.now();
+        if (st.havePrice && t - (this.quoteBookAt.get(symbol) ?? 0) >= BOOK_QUOTE_THROTTLE_MS) {
+          this.quoteBookAt.set(symbol, t);
+          this.emitQuote(symbol, st);
+        }
+      }
+    }
+
+    // Full depth-of-market (mbp-10) for the DOM UI — only watched symbols, throttled.
+    if (!this.bookSymbols.has(symbol)) return;
     const now = Date.now();
     if (now - (this.bookEmitAt.get(symbol) ?? 0) < BOOK_THROTTLE_MS) return;
     this.bookEmitAt.set(symbol, now);

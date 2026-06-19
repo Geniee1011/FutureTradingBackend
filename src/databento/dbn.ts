@@ -16,6 +16,7 @@
    feed() is partial-safe: it buffers across chunks and only emits complete records. */
 
 const RTYPE_TRADE = 0x00;
+const RTYPE_MBP1 = 0x01; // top-of-book (best bid/ask) — one price level
 const RTYPE_MBP10 = 0x0a;
 const RTYPE_SYMBOL_MAPPING = 0x16; // live gateway → instrument_id ↔ subscribed symbol
 const HEADER_BYTES = 16;
@@ -29,6 +30,7 @@ const MBP10_LEVELS = 10;
 const LEVELS_OFFSET = HEADER_BYTES + 32; // = 48
 const LEVEL_BYTES = 32;
 const MBP10_MIN_BYTES = LEVELS_OFFSET + MBP10_LEVELS * LEVEL_BYTES; // = 368
+const MBP1_MIN_BYTES = LEVELS_OFFSET + LEVEL_BYTES; // = 80 — header + flds + one BidAskPair
 
 export interface DecodedTrade {
   kind: "trade";
@@ -104,8 +106,10 @@ export class DbnDecoder {
           price: Number(this.buf.readBigInt64LE(HEADER_BYTES)) / PRICE_SCALE,
           size: recBytes >= 28 ? this.buf.readUInt32LE(24) : 0,
         });
+      } else if (rtype === RTYPE_MBP1 && recBytes >= MBP1_MIN_BYTES) {
+        out.push(decodeTopOfBook(this.buf, 1));
       } else if (rtype === RTYPE_MBP10 && recBytes >= MBP10_MIN_BYTES) {
-        out.push(decodeMbp10(this.buf));
+        out.push(decodeTopOfBook(this.buf, MBP10_LEVELS));
       } else if (rtype === RTYPE_SYMBOL_MAPPING) {
         // The gateway emits these at session start (and on rolls): they bind the
         // LIVE instrument_id to the symbol we subscribed by. The exact field
@@ -132,13 +136,13 @@ export class DbnDecoder {
   }
 }
 
-/** Decode one complete mbp-10 record (caller guarantees buf holds >= MBP10_MIN_BYTES). */
-function decodeMbp10(buf: Buffer): DecodedBook {
+/** Decode an mbp-1 (levels=1) or mbp-10 (levels=10) record; level 0 is the BBO. */
+function decodeTopOfBook(buf: Buffer, levels: number): DecodedBook {
   const instrumentId = buf.readUInt32LE(4);
   const ts = Number(buf.readBigUInt64LE(8) / 1_000_000n);
   const bids: BookLevel[] = [];
   const asks: BookLevel[] = [];
-  for (let i = 0; i < MBP10_LEVELS; i++) {
+  for (let i = 0; i < levels; i++) {
     const o = LEVELS_OFFSET + i * LEVEL_BYTES;
     const bidPx = buf.readBigInt64LE(o);
     const askPx = buf.readBigInt64LE(o + 8);
