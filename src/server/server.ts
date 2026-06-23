@@ -181,6 +181,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/positions/close" && req.method === "POST") {
     return handleClosePosition(req, res, opts.orderEngine);
   }
+  if (url.pathname === "/api/positions/bracket" && req.method === "POST") {
+    return handlePositionBracket(req, res, opts.orderEngine);
+  }
   if (url.pathname === "/api/account" && req.method === "GET") {
     return handleAccount(req, res);
   }
@@ -621,6 +624,15 @@ async function handleModifyOrder(url: URL, req: IncomingMessage, res: ServerResp
   const body = await readJson<{ price?: number | null; stopLoss?: number | null; takeProfit?: number | null }>(req);
   if (!body) return json(res, 400, { error: "invalid body" });
   const result = await engine.modify(accountId, decodeURIComponent(orderId), body);
+  json(res, result.ok ? 200 : 400, result);
+}
+
+async function handlePositionBracket(req: IncomingMessage, res: ServerResponse, engine: OrderEngine) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const body = await readJson<{ symbol?: string; stopLoss?: number | null; takeProfit?: number | null }>(req);
+  if (!body?.symbol) return json(res, 400, { error: "symbol is required" });
+  const result = await engine.setPositionBracket(accountId, body.symbol, { stopLoss: body.stopLoss, takeProfit: body.takeProfit });
   json(res, result.ok ? 200 : 400, result);
 }
 

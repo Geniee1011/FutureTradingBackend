@@ -406,6 +406,75 @@ export class OrderEngine {
     }
   }
 
+  /**
+   * Attach / update / remove a protective bracket on an OPEN position (chart "+SL/+TP"
+   * on the position line). Re-creates the OCO exit legs, preserving whichever leg isn't
+   * being changed. `null` removes a leg; both null cancels the bracket entirely.
+   */
+  async setPositionBracket(
+    accountId: string,
+    symbol: string,
+    changes: { stopLoss?: number | null; takeProfit?: number | null },
+  ): Promise<PlaceResult> {
+    const client = await getPool().connect();
+    try {
+      await client.query("BEGIN");
+      const posRes = await client.query<{ side: string; quantity: number; averagePrice: string }>(
+        `SELECT "side","quantity","averagePrice" FROM "Position" WHERE "accountId" = $1 AND "symbol" = $2 FOR UPDATE`,
+        [accountId, symbol],
+      );
+      const pos = posRes.rows[0];
+      if (!pos) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "No open position to attach a bracket to." };
+      }
+      const qty = Number(pos.quantity);
+      const avg = Number(pos.averagePrice);
+      const entrySide: ApiSide = pos.side === "LONG" ? "buy" : "sell"; // exit legs orient off this
+
+      // Preserve the leg that isn't being changed.
+      const legRes = await client.query<{ type: string; requestedPrice: string }>(
+        `SELECT "type","requestedPrice" FROM "Order"
+         WHERE "accountId" = $1 AND "symbol" = $2 AND "status" = 'PENDING' AND "ocoGroupId" IS NOT NULL`,
+        [accountId, symbol],
+      );
+      let curSl: number | null = null;
+      let curTp: number | null = null;
+      for (const l of legRes.rows) {
+        if (l.type === "STOP") curSl = Number(l.requestedPrice);
+        else if (l.type === "LIMIT") curTp = Number(l.requestedPrice);
+      }
+      const newSl = changes.stopLoss !== undefined ? (changes.stopLoss == null ? null : Number(changes.stopLoss)) : curSl;
+      const newTp = changes.takeProfit !== undefined ? (changes.takeProfit == null ? null : Number(changes.takeProfit)) : curTp;
+
+      if (newSl == null && newTp == null) {
+        await client.query(
+          `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'bracket removed', "updatedAt" = now()
+           WHERE "accountId" = $1 AND "symbol" = $2 AND "status" = 'PENDING' AND "ocoGroupId" IS NOT NULL`,
+          [accountId, symbol],
+        );
+        await client.query("COMMIT");
+        this.accountStream.publishOrderUpdate(accountId, { symbol, status: "cancelled" });
+        return { ok: true };
+      }
+
+      const bErr = bracketError(entrySide, avg, newSl, newTp);
+      if (bErr) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: bErr };
+      }
+      await this.createBracketChildren(client, accountId, symbol, entrySide, qty, newSl, newTp);
+      await client.query("COMMIT");
+      this.accountStream.publishOrderUpdate(accountId, { symbol, status: "open" });
+      return { ok: true };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      return { ok: false, error: (err as Error).message };
+    } finally {
+      client.release();
+    }
+  }
+
   // --- helpers -----------------------------------------------------
 
   private async getPosition(client: PoolClient, accountId: string, symbol: string): Promise<PositionRow | null> {
