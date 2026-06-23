@@ -3,6 +3,7 @@ import type { PoolClient } from "pg";
 import { getPool } from "../db/pool.js";
 import { useDatabase } from "../config.js";
 import { getInstrument, getMultiplier } from "../instruments.js";
+import { isMarketOpen, MARKET_CLOSED_MESSAGE } from "./market-hours.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 
 /* ------------------------------------------------------------------ *
@@ -26,6 +27,11 @@ export interface PlaceOrderInput {
   /** Optional bracket: on entry fill, place an opposing stop (SL) / limit (TP), OCO-linked. */
   stopLoss?: number | null;
   takeProfit?: number | null;
+}
+
+/** Options for order placement; `bypassMarketHours` is for system/admin paths only. */
+export interface PlaceOptions {
+  bypassMarketHours?: boolean;
 }
 
 export interface PlaceResult {
@@ -78,9 +84,12 @@ export class OrderEngine {
     this.monitorTimer = null;
   }
 
-  async place(accountId: string, input: PlaceOrderInput): Promise<PlaceResult> {
+  async place(accountId: string, input: PlaceOrderInput, opts?: PlaceOptions): Promise<PlaceResult> {
     const inst = getInstrument(input.symbol);
     if (!inst) return { ok: false, error: "Unknown instrument." };
+    // Market-hours gate: no buying or selling while the exchange is closed.
+    // Bypassed only for system/admin actions (risk liquidation, admin close-all).
+    if (!opts?.bypassMarketHours && !isMarketOpen()) return { ok: false, error: MARKET_CLOSED_MESSAGE };
     if (!Number.isInteger(input.quantity) || input.quantity <= 0)
       return { ok: false, error: "Quantity must be a positive whole number of contracts." };
     if (input.type !== "market" && !(typeof input.price === "number" && input.price > 0))
@@ -184,7 +193,7 @@ export class OrderEngine {
   }
 
   /** Close a symbol's whole position with an opposing market order. */
-  async closePosition(accountId: string, symbol: string): Promise<PlaceResult> {
+  async closePosition(accountId: string, symbol: string, opts?: PlaceOptions): Promise<PlaceResult> {
     const pool = getPool();
     const { rows } = await pool.query<PositionRow>(
       `SELECT "id","side","quantity","averagePrice" FROM "Position" WHERE "accountId" = $1 AND "symbol" = $2`,
@@ -193,7 +202,7 @@ export class OrderEngine {
     const pos = rows[0];
     if (!pos) return { ok: false, error: "No open position to close." };
     const side: ApiSide = pos.side === "LONG" ? "sell" : "buy";
-    const result = await this.place(accountId, { symbol, side, type: "market", quantity: Number(pos.quantity) });
+    const result = await this.place(accountId, { symbol, side, type: "market", quantity: Number(pos.quantity) }, opts);
     // Flat now → any resting SL/TP legs for this symbol are moot; cancel them.
     if (result.ok) await this.cancelBracketsForSymbol(accountId, symbol);
     return result;
@@ -252,7 +261,8 @@ export class OrderEngine {
     const { rows } = await getPool().query<{ symbol: string }>(`SELECT "symbol" FROM "Position" WHERE "accountId" = $1`, [accountId]);
     let closed = 0;
     for (const r of rows) {
-      const res = await this.closePosition(accountId, r.symbol).catch(() => ({ ok: false as const }));
+      // Admin flatten must work regardless of session — bypass the market-hours gate.
+      const res = await this.closePosition(accountId, r.symbol, { bypassMarketHours: true }).catch(() => ({ ok: false as const }));
       if (res.ok) closed += 1;
     }
     return closed;
@@ -298,6 +308,96 @@ export class OrderEngine {
 
       this.accountStream.publishOrderUpdate(accountId, { id: orderId, status: "cancelled", symbol: row.symbol });
       return { ok: true, orderId, status: "CANCELLED" };
+    } catch (err) {
+      await client.query("ROLLBACK").catch(() => {});
+      return { ok: false, error: (err as Error).message };
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Modify a working (PENDING) order without filling it — used by the chart's
+   * drag-to-edit. `price` moves the order's own level (entry, or a bracket exit
+   * leg). `stopLoss`/`takeProfit` move the attached bracket on an ENTRY order
+   * (pass null to remove a leg); they don't apply to an exit leg, which has no
+   * bracket of its own. Each field is optional — only the dragged one is sent.
+   */
+  async modify(
+    accountId: string,
+    orderId: string,
+    changes: { price?: number | null; stopLoss?: number | null; takeProfit?: number | null },
+  ): Promise<PlaceResult> {
+    const client = await getPool().connect();
+    try {
+      await client.query("BEGIN");
+      const lock = await client.query<{
+        status: string; accountId: string; symbol: string; side: string; type: string;
+        requestedPrice: string | null; ocoGroupId: string | null; slPrice: string | null; tpPrice: string | null;
+      }>(
+        `SELECT "status","accountId","symbol","side","type","requestedPrice","ocoGroupId","slPrice","tpPrice"
+         FROM "Order" WHERE "id" = $1 FOR UPDATE`,
+        [orderId],
+      );
+      const row = lock.rows[0];
+      if (!row || row.accountId !== accountId) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "Order not found." };
+      }
+      if (row.status !== "PENDING") {
+        await client.query("ROLLBACK");
+        return { ok: false, error: `Order is ${row.status.toLowerCase()} and can no longer be modified.` };
+      }
+
+      // The order's own price level (entry order, or a bracket exit leg).
+      let newPrice = row.requestedPrice != null ? Number(row.requestedPrice) : null;
+      if (changes.price !== undefined) {
+        if (!(typeof changes.price === "number" && changes.price > 0)) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "A valid price is required." };
+        }
+        newPrice = changes.price;
+      }
+
+      const isExitLeg = row.ocoGroupId != null;
+      const touchesBracket = changes.stopLoss !== undefined || changes.takeProfit !== undefined;
+      if (touchesBracket && isExitLeg) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "This order has no attached bracket to modify." };
+      }
+
+      let newSl = row.slPrice != null ? Number(row.slPrice) : null;
+      let newTp = row.tpPrice != null ? Number(row.tpPrice) : null;
+      if (changes.stopLoss !== undefined) newSl = changes.stopLoss == null ? null : Number(changes.stopLoss);
+      if (changes.takeProfit !== undefined) newTp = changes.takeProfit == null ? null : Number(changes.takeProfit);
+
+      // Validate the bracket against the (new) entry price on an entry order.
+      if (!isExitLeg && newPrice != null) {
+        const bErr = bracketError(row.side.toLowerCase() as ApiSide, newPrice, newSl, newTp);
+        if (bErr) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: bErr };
+        }
+      }
+
+      // A STOP order keeps its trigger in stopPrice too — keep it in sync on a move.
+      const isStop = row.type === "STOP";
+      await client.query(
+        `UPDATE "Order"
+           SET "requestedPrice" = $2,
+               "stopPrice" = CASE WHEN $3 THEN $2 ELSE "stopPrice" END,
+               "slPrice" = $4, "tpPrice" = $5, "updatedAt" = now()
+         WHERE "id" = $1`,
+        [orderId, newPrice, isStop, newSl, newTp],
+      );
+      await this.log(
+        client, accountId, "ORDER_MODIFIED",
+        `${row.side.toLowerCase()} ${row.symbol} ${row.type.toLowerCase()} → ${newPrice}${touchesBracket ? ` (SL ${newSl ?? "—"} / TP ${newTp ?? "—"})` : ""}`,
+      );
+      await client.query("COMMIT");
+
+      this.accountStream.publishOrderUpdate(accountId, { id: orderId, status: "open", symbol: row.symbol });
+      return { ok: true, orderId, status: "PENDING", fillPrice: null };
     } catch (err) {
       await client.query("ROLLBACK").catch(() => {});
       return { ok: false, error: (err as Error).message };
@@ -453,6 +553,7 @@ export class OrderEngine {
   /** Scan all working orders and fill any whose trigger the live price has crossed. */
   private async scanWorkingOrders(): Promise<void> {
     if (this.scanning) return; // skip if the previous scan is still running
+    if (!isMarketOpen()) return; // market closed → the mark is stale; don't trigger fills
     this.scanning = true;
     try {
       const { rows } = await getPool().query<WorkingOrder>(

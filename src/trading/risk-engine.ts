@@ -149,7 +149,10 @@ export class RiskEngine {
   private async liquidate(accountId: string): Promise<void> {
     const { rows } = await getPool().query<{ symbol: string }>(`SELECT "symbol" FROM "Position" WHERE "accountId" = $1`, [accountId]);
     for (const r of rows) {
-      await this.orderEngine.closePosition(accountId, r.symbol).catch((e) => console.error("[risk] liquidate failed:", (e as Error).message));
+      // Risk liquidation must always run — bypass the market-hours gate.
+      await this.orderEngine
+        .closePosition(accountId, r.symbol, { bypassMarketHours: true })
+        .catch((e) => console.error("[risk] liquidate failed:", (e as Error).message));
     }
   }
 }

@@ -61,7 +61,22 @@ const HEARTBEAT_MS = 30_000;
 
 /** Build the combined HTTP (REST history + health) and WebSocket (/ws) server. */
 export function createMarketServer(hub: MarketHub, opts: ServerOptions) {
-  const http = createServer((req, res) => handleHttp(req, res, hub, opts));
+  const http = createServer((req, res) => {
+    // Catch any rejection from an async route handler (e.g. a transient DB ECONNRESET)
+    // so it returns a 500 instead of becoming an unhandled rejection that crashes the
+    // process. handleHttp returns the handler's promise (no longer fire-and-forget).
+    Promise.resolve(handleHttp(req, res, hub, opts)).catch((err) => {
+      console.error(`[http] ${req.method} ${req.url} failed:`, (err as Error).message);
+      if (!res.headersSent) {
+        try {
+          res.writeHead(500, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ error: "internal server error" }));
+        } catch {
+          res.end();
+        }
+      }
+    });
+  });
   const wss = new WebSocketServer({ noServer: true });
 
   // Track liveness for heartbeat.
@@ -124,78 +139,81 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
 
   // --- Auth ---
   if (url.pathname === "/api/auth/login" && req.method === "POST") {
-    return void handleLogin(req, res, opts.auth);
+    return handleLogin(req, res, opts.auth);
   }
   if (url.pathname === "/api/auth/register" && req.method === "POST") {
-    return void handleRegister(req, res, opts.auth);
+    return handleRegister(req, res, opts.auth);
   }
   if (url.pathname === "/api/auth/me" && req.method === "GET") {
-    return void handleMe(req, res, opts.auth);
+    return handleMe(req, res, opts.auth);
   }
   if (url.pathname === "/api/auth/change-password" && req.method === "POST") {
-    return void handleChangePassword(req, res, opts.auth);
+    return handleChangePassword(req, res, opts.auth);
   }
 
   // --- Market-data connection (Model B / byo: each user's own Databento key) ---
   if (url.pathname === "/api/market-data/connection" && req.method === "GET") {
-    return void handleByoConnectionStatus(req, res);
+    return handleByoConnectionStatus(req, res);
   }
   if (url.pathname === "/api/market-data/connection" && req.method === "POST") {
-    return void handleByoConnect(req, res);
+    return handleByoConnect(req, res);
   }
   if (url.pathname === "/api/market-data/connection" && req.method === "DELETE") {
-    return void handleByoDisconnect(req, res);
+    return handleByoDisconnect(req, res);
   }
 
   // --- Trading (authenticated, DB-backed) ---
   if (url.pathname === "/api/positions" && req.method === "GET") {
-    return void handlePositions(req, res);
+    return handlePositions(req, res);
   }
   if (url.pathname === "/api/orders" && req.method === "GET") {
-    return void handleOrders(req, res);
+    return handleOrders(req, res);
   }
   if (url.pathname === "/api/orders" && req.method === "POST") {
-    return void handlePlaceOrder(req, res, opts.orderEngine);
+    return handlePlaceOrder(req, res, opts.orderEngine);
   }
   if (/^\/api\/orders\/[^/]+\/cancel$/.test(url.pathname) && req.method === "POST") {
-    return void handleCancelOrder(url, req, res, opts.orderEngine);
+    return handleCancelOrder(url, req, res, opts.orderEngine);
+  }
+  if (/^\/api\/orders\/[^/]+\/modify$/.test(url.pathname) && req.method === "POST") {
+    return handleModifyOrder(url, req, res, opts.orderEngine);
   }
   if (url.pathname === "/api/positions/close" && req.method === "POST") {
-    return void handleClosePosition(req, res, opts.orderEngine);
+    return handleClosePosition(req, res, opts.orderEngine);
   }
   if (url.pathname === "/api/account" && req.method === "GET") {
-    return void handleAccount(req, res);
+    return handleAccount(req, res);
   }
   if (url.pathname === "/api/transactions" && req.method === "GET") {
-    return void handleTransactions(req, res);
+    return handleTransactions(req, res);
   }
   if (url.pathname === "/api/violations" && req.method === "GET") {
-    return void handleViolations(req, res);
+    return handleViolations(req, res);
   }
   if (url.pathname === "/api/equity-curve" && req.method === "GET") {
-    return void handleEquityCurve(req, res);
+    return handleEquityCurve(req, res);
   }
 
   // --- Admin (ADMIN role only) ---
-  if (url.pathname === "/api/admin/traders" && req.method === "GET") return void handleAdmin(req, res, adminListTraders);
+  if (url.pathname === "/api/admin/traders" && req.method === "GET") return handleAdmin(req, res, adminListTraders);
   if (/^\/api\/admin\/traders\/[^/]+$/.test(url.pathname) && req.method === "GET")
-    return void handleAdmin(req, res, () => adminGetTraderDetail(url.pathname.split("/")[4]!));
-  if (url.pathname === "/api/admin/accounts" && req.method === "GET") return void handleAdmin(req, res, adminListAccounts);
-  if (url.pathname === "/api/admin/activity" && req.method === "GET") return void handleAdmin(req, res, () => adminListActivity(200));
-  if (url.pathname === "/api/admin/violations" && req.method === "GET") return void handleAdmin(req, res, () => adminListViolations(200));
+    return handleAdmin(req, res, () => adminGetTraderDetail(url.pathname.split("/")[4]!));
+  if (url.pathname === "/api/admin/accounts" && req.method === "GET") return handleAdmin(req, res, adminListAccounts);
+  if (url.pathname === "/api/admin/activity" && req.method === "GET") return handleAdmin(req, res, () => adminListActivity(200));
+  if (url.pathname === "/api/admin/violations" && req.method === "GET") return handleAdmin(req, res, () => adminListViolations(200));
   if (url.pathname === "/api/admin/positions" && req.method === "GET")
-    return void handleAdmin(req, res, async () => ({ open: await adminListOpenPositions(), closed: await adminListClosedPositions(500) }));
-  if (url.pathname === "/api/admin/rules" && req.method === "GET") return void handleAdmin(req, res, adminListRules);
+    return handleAdmin(req, res, async () => ({ open: await adminListOpenPositions(), closed: await adminListClosedPositions(500) }));
+  if (url.pathname === "/api/admin/rules" && req.method === "GET") return handleAdmin(req, res, adminListRules);
   if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
-    return void handleAdminStatus(url, req, res, opts.accountStream, "trader");
+    return handleAdminStatus(url, req, res, opts.accountStream, "trader");
   if (/^\/api\/admin\/traders\/[^/]+\/password$/.test(url.pathname) && req.method === "POST")
-    return void handleAdminResetPassword(url, req, res, opts.auth);
+    return handleAdminResetPassword(url, req, res, opts.auth);
   if (/^\/api\/admin\/accounts\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
-    return void handleAdminStatus(url, req, res, opts.accountStream, "account");
+    return handleAdminStatus(url, req, res, opts.accountStream, "account");
   if (/^\/api\/admin\/accounts\/[^/]+\/(reset|adjust-balance|close-all|liquidate|cancel-orders)$/.test(url.pathname) && req.method === "POST")
-    return void handleAdminAccountAction(url, req, res, opts.orderEngine, opts.accountStream);
+    return handleAdminAccountAction(url, req, res, opts.orderEngine, opts.accountStream);
   if (/^\/api\/admin\/rules\/[^/]+$/.test(url.pathname) && req.method === "POST")
-    return void handleAdminRuleUpdate(url, req, res);
+    return handleAdminRuleUpdate(url, req, res);
 
   if (url.pathname === "/health") {
     return json(res, 200, {
@@ -223,11 +241,11 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
 
   if (url.pathname === "/api/history" && req.method === "GET") {
     // Model B: serve chart history from the requesting user's OWN Databento key.
-    if (config.marketDataMode === "byo") return void handleByoHistory(url, req, res);
-    return void handleHistory(url, res, hub);
+    if (config.marketDataMode === "byo") return handleByoHistory(url, req, res);
+    return handleHistory(url, res, hub);
   }
   if (url.pathname === "/api/market-data/quote" && req.method === "GET") {
-    return void handleByoQuote(url, req, res);
+    return handleByoQuote(url, req, res);
   }
 
   json(res, 404, { error: "not found" });
@@ -236,7 +254,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
 async function handleHistory(url: URL, res: ServerResponse, hub: MarketHub) {
   const symbol = url.searchParams.get("symbol");
   const resolution = Number(url.searchParams.get("resolution") ?? "60");
-  const count = Math.min(Number(url.searchParams.get("count") ?? "240"), 1000);
+  // Cap generously: 1m charts request ~7 trading days (≈9,600 bars). Keep an upper
+  // bound to guard against abuse, but well above the deepest legitimate request.
+  const count = Math.min(Number(url.searchParams.get("count") ?? "240"), 12000);
 
   if (!symbol || !SYMBOLS.includes(symbol)) {
     return json(res, 400, { error: "invalid or missing symbol" });
@@ -477,7 +497,9 @@ async function requireUserKey(req: IncomingMessage, res: ServerResponse): Promis
 async function handleByoHistory(url: URL, req: IncomingMessage, res: ServerResponse) {
   const symbol = url.searchParams.get("symbol");
   const resolution = Number(url.searchParams.get("resolution") ?? "60");
-  const count = Math.min(Number(url.searchParams.get("count") ?? "240"), 1000);
+  // Cap generously: 1m charts request ~7 trading days (≈9,600 bars). Keep an upper
+  // bound to guard against abuse, but well above the deepest legitimate request.
+  const count = Math.min(Number(url.searchParams.get("count") ?? "240"), 12000);
   if (!symbol || !SYMBOLS.includes(symbol)) return json(res, 400, { error: "invalid or missing symbol" });
   if (!Number.isFinite(resolution) || resolution <= 0) return json(res, 400, { error: "invalid resolution" });
   const auth = await requireUserKey(req, res);
@@ -588,6 +610,17 @@ async function handleCancelOrder(url: URL, req: IncomingMessage, res: ServerResp
   const orderId = url.pathname.split("/")[3]; // /api/orders/:id/cancel
   if (!orderId) return json(res, 400, { error: "order id is required" });
   const result = await engine.cancel(accountId, decodeURIComponent(orderId));
+  json(res, result.ok ? 200 : 400, result);
+}
+
+async function handleModifyOrder(url: URL, req: IncomingMessage, res: ServerResponse, engine: OrderEngine) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const orderId = url.pathname.split("/")[3]; // /api/orders/:id/modify
+  if (!orderId) return json(res, 400, { error: "order id is required" });
+  const body = await readJson<{ price?: number | null; stopLoss?: number | null; takeProfit?: number | null }>(req);
+  if (!body) return json(res, 400, { error: "invalid body" });
+  const result = await engine.modify(accountId, decodeURIComponent(orderId), body);
   json(res, result.ok ? 200 : 400, result);
 }
 

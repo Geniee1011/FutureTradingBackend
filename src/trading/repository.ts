@@ -259,12 +259,14 @@ export interface ApiOrder {
   updatedAt: number;
   reason?: string;
   bracketRole?: "SL" | "TP"; // set when this order is a bracket exit leg (stop=SL, limit=TP)
+  slPrice?: number | null; // bracket stop-loss attached to a working entry (until it fills)
+  tpPrice?: number | null; // bracket take-profit attached to a working entry (until it fills)
 }
 
 export async function listOrders(accountId: string): Promise<ApiOrder[]> {
   const { rows } = await getPool().query(
     `SELECT "id","symbol","side","type","status","quantity","filledQuantity",
-            "requestedPrice","fillPrice","reason","ocoGroupId","createdAt","updatedAt"
+            "requestedPrice","fillPrice","reason","ocoGroupId","slPrice","tpPrice","createdAt","updatedAt"
      FROM "Order" WHERE "accountId" = $1 ORDER BY "createdAt" DESC`,
     [accountId],
   );
@@ -287,6 +289,8 @@ export async function listOrders(accountId: string): Promise<ApiOrder[]> {
       updatedAt: new Date(r.updatedAt).getTime(),
       reason: r.reason ?? undefined,
       bracketRole,
+      slPrice: r.slPrice != null ? Number(r.slPrice) : null,
+      tpPrice: r.tpPrice != null ? Number(r.tpPrice) : null,
     } satisfies ApiOrder;
   });
 }

@@ -144,3 +144,10 @@ function shutdown() {
 }
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
+
+// Last-resort guard: a transient fault (e.g. a Postgres ECONNRESET on a detached
+// background task — daily-stats poll, WS message handler) must not take the whole
+// server down. Log it and keep serving; the DB pool reconnects on the next query.
+process.on("unhandledRejection", (reason) => {
+  console.error("[process] unhandled rejection:", reason instanceof Error ? reason.message : reason);
+});
