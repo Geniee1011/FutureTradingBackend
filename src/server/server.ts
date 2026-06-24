@@ -382,6 +382,10 @@ async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: Ser
         return json(res, 400, { error: "unknown action" });
     }
     await accountStream.refreshAccount(accountId).catch(() => {});
+    // A reset zeroes equity back to the starting balance — clear the trailing drawdown
+    // peak too (after the snapshot reload) so live drawdown recomputes to $0, not the
+    // pre-reset high-water mark.
+    if (action === "reset") accountStream.resetDrawdownPeak(accountId);
     accountStream.publishAdminUpdate({ kind: `account_${action}`, id: accountId });
     json(res, 200, result);
   } catch (err) {

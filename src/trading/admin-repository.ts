@@ -602,16 +602,22 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
       await client.query("ROLLBACK");
       return false;
     }
+    // Clear LIVE state so the new challenge starts flat: drop open positions and cancel
+    // any resting orders (so they can't trigger in the new challenge). HISTORY — filled
+    // orders, transactions, violations, closed positions, activity — is KEPT so admins can
+    // still see every challenge. The trader's own views are scoped by challengeStartedAt.
     await client.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
-    await client.query(`DELETE FROM "Order" WHERE "accountId" = $1`, [accountId]); // Fills cascade
-    await client.query(`DELETE FROM "Violation" WHERE "accountId" = $1`, [accountId]);
-    await client.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
+    await client.query(
+      `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'Challenge reset', "updatedAt" = now()
+       WHERE "accountId" = $1 AND "status" = 'PENDING'`,
+      [accountId],
+    );
     await client.query(`INSERT INTO "Transaction" ("accountId","type","amount","description") VALUES ($1,'DEPOSIT',$2,'Account reset — opening balance')`, [accountId, sb]);
     await client.query(
       `UPDATE "Account" SET "balance" = "startingBalance", "equity" = "startingBalance",
               "dailyPnl" = 0, "totalPnl" = 0, "drawdown" = 0, "highestEquity" = "startingBalance",
               "dayStartEquity" = "startingBalance", "dayStartAt" = CURRENT_DATE,
-              "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
+              "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
       [accountId],
     );
     await client.query("COMMIT");

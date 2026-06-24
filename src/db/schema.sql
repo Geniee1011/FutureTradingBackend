@@ -54,6 +54,12 @@ CREATE INDEX IF NOT EXISTS "Account_status_idx" ON "Account" ("status");
 -- the date it belongs to. The risk engine rolls these at the date boundary.
 ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "dayStartEquity" numeric(18,2);
 ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "dayStartAt"     date;
+-- Per-challenge boundary. Trades/transactions before this belong to a previous (failed)
+-- challenge: the TRADER's own history is scoped to >= this, while admins see everything.
+-- Reset bumps it to now(); existing rows backfill to the account's creation date.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "challengeStartedAt" timestamptz;
+UPDATE "Account" SET "challengeStartedAt" = "createdAt" WHERE "challengeStartedAt" IS NULL;
+ALTER TABLE "Account" ALTER COLUMN "challengeStartedAt" SET DEFAULT now();
 
 CREATE TABLE IF NOT EXISTS "Rule" (
   "id"                 text PRIMARY KEY DEFAULT gen_random_uuid()::text,

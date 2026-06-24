@@ -16,7 +16,9 @@ export interface ViolationRecord {
 /** A trader's own rule violations (newest first) for the violation-status view. */
 export async function listViolations(accountId: string): Promise<ViolationRecord[]> {
   const { rows } = await getPool().query(
-    `SELECT "id","type","action","detail","createdAt" FROM "Violation" WHERE "accountId" = $1 ORDER BY "createdAt" DESC LIMIT 100`,
+    `SELECT "id","type","action","detail","createdAt" FROM "Violation"
+     WHERE "accountId" = $1 AND "createdAt" >= (SELECT "challengeStartedAt" FROM "Account" WHERE "id" = $1)
+     ORDER BY "createdAt" DESC LIMIT 100`,
     [accountId],
   );
   return rows.map((r) => ({
@@ -138,7 +140,9 @@ export interface ApiTransaction {
 /** Realized balance curve: cumulative transaction amounts over time (epoch seconds). */
 export async function getEquityCurve(accountId: string): Promise<{ time: number; value: number }[]> {
   const { rows } = await getPool().query(
-    `SELECT "amount","createdAt" FROM "Transaction" WHERE "accountId" = $1 ORDER BY "createdAt" ASC`,
+    `SELECT "amount","createdAt" FROM "Transaction"
+     WHERE "accountId" = $1 AND "createdAt" >= (SELECT "challengeStartedAt" FROM "Account" WHERE "id" = $1)
+     ORDER BY "createdAt" ASC`,
     [accountId],
   );
   // Map keyed by second so multiple txns in the same second collapse (chart needs unique times).
@@ -161,7 +165,9 @@ export async function getEquityCurve(accountId: string): Promise<{ time: number;
 export async function listTransactions(accountId: string): Promise<ApiTransaction[]> {
   const { rows } = await getPool().query(
     `SELECT "id","type","amount","description","createdAt"
-     FROM "Transaction" WHERE "accountId" = $1 ORDER BY "createdAt" DESC`,
+     FROM "Transaction"
+     WHERE "accountId" = $1 AND "createdAt" >= (SELECT "challengeStartedAt" FROM "Account" WHERE "id" = $1)
+     ORDER BY "createdAt" DESC`,
     [accountId],
   );
   return rows.map((r) => ({
@@ -267,7 +273,9 @@ export async function listOrders(accountId: string): Promise<ApiOrder[]> {
   const { rows } = await getPool().query(
     `SELECT "id","symbol","side","type","status","quantity","filledQuantity",
             "requestedPrice","fillPrice","reason","ocoGroupId","slPrice","tpPrice","createdAt","updatedAt"
-     FROM "Order" WHERE "accountId" = $1 ORDER BY "createdAt" DESC`,
+     FROM "Order"
+     WHERE "accountId" = $1 AND "createdAt" >= (SELECT "challengeStartedAt" FROM "Account" WHERE "id" = $1)
+     ORDER BY "createdAt" DESC`,
     [accountId],
   );
   return rows.map((r) => {

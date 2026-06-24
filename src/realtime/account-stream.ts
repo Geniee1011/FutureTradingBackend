@@ -132,6 +132,16 @@ export class AccountStream {
     this.broadcastPositions(accountId);
   }
 
+  /**
+   * Drop the trailing high-water mark so live drawdown is recomputed from the (reset)
+   * equity — call after an admin reset. The peak otherwise ratchets only upward, so it
+   * would keep reporting the pre-reset drawdown against the old high. Next tick re-seeds
+   * it from the fresh equity (= starting balance), giving a $0 drawdown.
+   */
+  resetDrawdownPeak(accountId: string) {
+    this.peaks.delete(accountId);
+  }
+
   /** Current positions for an account, marked against the latest quotes. */
   private livePositions(acc: CachedAccount): ApiPosition[] {
     return acc.positions.map((p) => {
