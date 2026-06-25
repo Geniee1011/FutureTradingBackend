@@ -205,7 +205,11 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/admin/activity" && req.method === "GET") return handleAdmin(req, res, () => adminListActivity(200));
   if (url.pathname === "/api/admin/violations" && req.method === "GET") return handleAdmin(req, res, () => adminListViolations(200));
   if (url.pathname === "/api/admin/positions" && req.method === "GET")
-    return handleAdmin(req, res, async () => ({ open: await adminListOpenPositions(), closed: await adminListClosedPositions(500) }));
+    return handleAdmin(req, res, async () => ({
+      // Pass the live quote feed so each open lot is marked-to-market (stored unrealized is never live).
+      open: await adminListOpenPositions((s) => opts.accountStream.getMarkPrice(s)),
+      closed: await adminListClosedPositions(500),
+    }));
   if (url.pathname === "/api/admin/rules" && req.method === "GET") return handleAdmin(req, res, adminListRules);
   if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return handleAdminStatus(url, req, res, opts.accountStream, "trader");

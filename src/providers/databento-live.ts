@@ -5,6 +5,7 @@ import { DatabentoClient } from "../databento/client.js";
 import { DbnDecoder, type DecodedBook, type DecodedMapping, type DecodedRecord, type DecodedTrade } from "../databento/dbn.js";
 import { aggregateCandles, fetchDailyStats, fetchHistory } from "./databento-shared.js";
 import { INSTRUMENTS, getInstrument } from "../instruments.js";
+import { isMarketOpen } from "../trading/market-hours.js";
 import type { Candle } from "../types.js";
 
 /* ------------------------------------------------------------------ *
@@ -21,6 +22,14 @@ const LIVE_PORT = 13000;
 const DAILY_POLL_MS = 30_000;
 const BASE_BACKOFF_MS = 1_000;
 const MAX_BACKOFF_MS = 15_000;
+// Stale-feed watchdog. A TCP socket can go "half-open" (the peer vanishes without a
+// FIN/RST), so `data`/`close` never fire again: the stream silently dies with no error
+// and the reconnect logic never runs. We subscribe to trades + top-of-book (mbp-1),
+// which print many times a second for liquid futures during market hours, so a long gap
+// with ZERO records means the socket is dead — force a reconnect. Generous threshold so
+// a genuinely quiet tape never trips it.
+const STALE_FEED_MS = 45_000;
+const WATCHDOG_MS = 15_000;
 // Coalesce book updates: mbp-10 can tick many times per millisecond on liquid
 // contracts, but the UI only needs a fresh snapshot a few times per second.
 const BOOK_THROTTLE_MS = 150;
@@ -80,6 +89,8 @@ export class DatabentoLiveProvider extends BaseProvider {
   private retries = 0;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private dailyTimer: NodeJS.Timeout | null = null;
+  private watchdogTimer: NodeJS.Timeout | null = null;
+  private lastRecordAt = 0; // epoch ms of the last DBN record received (stale-feed watchdog)
   private failing = false;
   private lastErrorLogAt = 0;
   private lastSocketError: string | null = null;
@@ -103,19 +114,37 @@ export class DatabentoLiveProvider extends BaseProvider {
   start(): void {
     if (this.running) return;
     this.running = true;
+    this.lastRecordAt = Date.now();
     void this.resolveIds();
     void this.pollDaily();
     this.scheduleDaily();
     this.connect();
+    if (!this.watchdogTimer) this.watchdogTimer = setInterval(() => this.checkFeedHealth(), WATCHDOG_MS);
   }
 
   stop(): void {
     this.running = false;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.dailyTimer) clearTimeout(this.dailyTimer);
-    this.reconnectTimer = this.dailyTimer = null;
+    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
+    this.reconnectTimer = this.dailyTimer = this.watchdogTimer = null;
     this.socket?.destroy();
     this.socket = null;
+  }
+
+  /**
+   * Detect a half-open socket: connected + authenticated (`streaming`) but no records
+   * for STALE_FEED_MS while the market is open. The socket never errored or closed, so
+   * nothing else would notice — force a reconnect to revive the feed.
+   */
+  private checkFeedHealth(): void {
+    if (!this.running || !this.streaming) return; // only when we believe we're live
+    if (!isMarketOpen()) return; // a quiet tape during a halt/closed session is expected
+    const gap = Date.now() - this.lastRecordAt;
+    if (gap <= STALE_FEED_MS) return;
+    this.logError(new Error(`no live data for ${Math.round(gap / 1000)}s — socket half-open, forcing reconnect`));
+    this.lastRecordAt = Date.now(); // avoid re-tripping before the new socket establishes
+    this.socket?.destroy(); // 'close' → scheduleReconnect() spins up a fresh connection
   }
 
   async getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]> {
@@ -325,6 +354,7 @@ export class DatabentoLiveProvider extends BaseProvider {
     // Reset backoff only once real data flows — reaching `success=` isn't enough,
     // since the gateway can ack then immediately close (see entitlement loop).
     if (this.retries) this.retries = 0;
+    this.lastRecordAt = Date.now(); // feed is alive — feeds the stale-feed watchdog
     if (r.kind === "trade") this.onTrade(r);
     else if (r.kind === "book") this.onBook(r);
     else this.onMapping(r);

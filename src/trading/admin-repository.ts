@@ -1,4 +1,5 @@
 import { getPool } from "../db/pool.js";
+import { getMultiplier } from "../instruments.js";
 
 /* Admin/CRM reads + mutations over the real DB. Shapes mirror the frontend
    types (TradingApp/src/lib/types.ts). Fields the schema doesn't track
@@ -262,15 +263,24 @@ export interface AdminClosedPosition {
 }
 
 /** Every OPEN position across all accounts (admin-wide Positions view). */
-export async function adminListOpenPositions(): Promise<AdminOpenPosition[]> {
+/**
+ * Live open positions for the admin CRM, one row per entry trade (lot).
+ *
+ * `markOf` supplies the current price per symbol (the WS quote feed) so each lot's
+ * UNREALIZED P&L is marked-to-market here — the stored `Position.unrealizedPnl` is
+ * never written live, so without this the admin's P&L column would sit at $0. Booked
+ * (realized) P&L for the still-open position is split across its lots by size.
+ */
+export async function adminListOpenPositions(
+  markOf?: (symbol: string) => number | undefined,
+): Promise<AdminOpenPosition[]> {
   // The internal CRM lists every entry trade SEPARATELY, so we read per-trade lots
   // (not the netted Position line the trader dashboard shows). Each lot keeps its own
-  // entry price + open time; the protective bracket is per-symbol (shared by the lots),
-  // and the netted position's unrealized P&L is split across its lots by quantity.
+  // entry price + open time; the protective bracket is per-symbol (shared by the lots).
   const { rows } = await getPool().query(
     `SELECT l."id", l."symbol", l."side", l."quantity", l."entryPrice", l."openedAt", l."accountId",
             u."id" AS "traderId", u."name", u."email",
-            p."quantity" AS "posQty", p."unrealizedPnl" AS "posUnrealized",
+            p."quantity" AS "posQty", p."realizedPnl" AS "posRealized",
             -- Per-symbol protective bracket = the open OCO exit legs (SL=STOP, TP=LIMIT).
             -- One bracket per symbol (old legs are cancelled on replace), so LIMIT 1 is exact.
             (SELECT o."requestedPrice" FROM "Order" o
@@ -289,12 +299,18 @@ export async function adminListOpenPositions(): Promise<AdminOpenPosition[]> {
   );
   return rows.map((r) => {
     const lotQty = Number(r.quantity);
+    const entry = Number(r.entryPrice);
+    const dir = r.side === "LONG" ? 1 : -1;
+    // Mark-to-market this lot against the live quote (same formula as the trader feed:
+    // (mark − entry) × qty × direction × contract multiplier). No mark yet → $0.
+    const mark = markOf?.(r.symbol);
+    const unrealizedPnl =
+      mark != null && mark > 0 ? Math.round((mark - entry) * lotQty * dir * getMultiplier(r.symbol) * 100) / 100 : 0;
+    // Booked (realized) P&L of the still-open position, split across its lots by size so
+    // the per-trade rows sum to the position total (a fresh, never-reduced trade → $0).
     const posQty = r.posQty != null ? Number(r.posQty) : lotQty;
-    const posUnreal = r.posUnrealized != null ? Number(r.posUnrealized) : 0;
-    // Split the netted unrealized P&L across lots by size so the per-trade rows still
-    // sum to the position total. Realized is booked only on close (→ ClosedPosition),
-    // so an open lot's booked realized is 0.
-    const unrealizedPnl = posQty > 0 ? Math.round(posUnreal * (lotQty / posQty) * 100) / 100 : 0;
+    const posRealized = r.posRealized != null ? Number(r.posRealized) : 0;
+    const realizedPnl = posQty > 0 ? Math.round(posRealized * (lotQty / posQty) * 100) / 100 : 0;
     return {
       id: r.id,
       traderId: r.traderId,
@@ -303,8 +319,8 @@ export async function adminListOpenPositions(): Promise<AdminOpenPosition[]> {
       symbol: r.symbol,
       side: r.side,
       quantity: lotQty,
-      averagePrice: Number(r.entryPrice),
-      realizedPnl: 0,
+      averagePrice: entry,
+      realizedPnl,
       unrealizedPnl,
       openedAt: ms(r.openedAt),
       stopLoss: r.stopLoss != null ? Number(r.stopLoss) : null,

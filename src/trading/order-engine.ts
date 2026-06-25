@@ -534,24 +534,15 @@ export class OrderEngine {
       return 0;
     }
 
-    // Opposing order: reduce, close, or flip. Realized P&L is in DOLLARS, so it
-    // includes the contract point value (ES=$50/pt, NQ=$20/pt, …) and rounds to
-    // cents — not price precision (which is 0 dp for YM/MYM and would drop cents).
+    // Opposing order: reduce, close, or flip. Close the oldest OPEN lots first (FIFO),
+    // booking a SEPARATE ClosedPosition per lot — each at its own entry price + open time —
+    // so the closed-trades log lists every entry trade individually instead of one blended
+    // row. Realized P&L is summed across the lots closed (dollars: includes the contract
+    // point value, ES=$50/pt, NQ=$20/pt, …, rounded to cents).
     const closedQty = Math.min(qty, existing.quantity);
-    const realized = Math.round((fillPrice - existing.averagePrice) * closedQty * dir * getMultiplier(symbol) * 100) / 100;
-
-    // Durable record of the closed (or reduced) portion — the live Position row
-    // may be deleted below, so this is what the admin Positions view reads.
-    await this.recordClosedPosition(
-      client,
-      accountId,
-      symbol,
-      existing.side,
-      closedQty,
-      existing.averagePrice,
-      fillPrice,
-      realized,
-      existing.openedAt,
+    const realized = await this.closeLotsFifo(
+      client, accountId, symbol, existing.side, closedQty, fillPrice,
+      getMultiplier(symbol), existing.averagePrice, existing.openedAt,
     );
 
     if (qty < existing.quantity) {
@@ -560,21 +551,16 @@ export class OrderEngine {
         existing.quantity - qty,
         realized,
       ]);
-      // Partial reduce: consume the oldest open lots (FIFO) by the closed quantity.
-      await this.consumeLots(client, accountId, symbol, qty);
     } else if (qty === existing.quantity) {
-      await client.query(`DELETE FROM "Position" WHERE "id" = $1`, [existing.id]);
-      // Flat → all lots for this symbol are closed.
-      await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2`, [accountId, symbol]);
+      await client.query(`DELETE FROM "Position" WHERE "id" = $1`, [existing.id]); // lots fully booked above
       await this.log(client, accountId, "POSITION_CLOSED", `${symbol} flat (realized ${realized})`);
     } else {
-      // Flip to the opposite side with the remainder.
+      // Flip: the old side is fully closed (its lots booked above); the remainder opens a
+      // fresh lot on the new side.
       await client.query(
         `UPDATE "Position" SET "side" = $2, "quantity" = $3, "averagePrice" = $4, "realizedPnl" = "realizedPnl" + $5, "updatedAt" = now() WHERE "id" = $1`,
         [existing.id, side === "buy" ? "LONG" : "SHORT", qty - existing.quantity, round(fillPrice), realized],
       );
-      // Old direction fully closed; the remainder opens a fresh lot on the new side.
-      await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2`, [accountId, symbol]);
       await this.insertLot(client, accountId, symbol, side, qty - existing.quantity, round(fillPrice));
       await this.log(client, accountId, "POSITION_CLOSED", `${existing.side.toLowerCase()} ${symbol} closed (realized ${realized})`);
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty - existing.quantity} ${symbol} @ ${round(fillPrice)}`);
@@ -597,17 +583,43 @@ export class OrderEngine {
     );
   }
 
-  /** Reduce the oldest open lots (FIFO) by a total quantity, deleting fully-consumed lots. */
-  private async consumeLots(client: PoolClient, accountId: string, symbol: string, qty: number): Promise<void> {
-    let remaining = qty;
-    const { rows } = await client.query<{ id: string; quantity: number }>(
-      `SELECT "id","quantity" FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2 ORDER BY "openedAt" ASC, "id" ASC`,
+  /**
+   * Close `closeQty` of a position against its OPEN lots, oldest first (FIFO), booking a
+   * SEPARATE ClosedPosition per lot — each at its own entry price + open time — so the
+   * closed-trades log lists every entry trade individually instead of one blended row.
+   * Consumes (reduces/deletes) the lots and returns the total realized P&L (dollars).
+   * `fallback*` cover the defensive case where lots don't fully back the position (e.g.
+   * pre-lot-tracking drift) so a closed record is never dropped.
+   */
+  private async closeLotsFifo(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    side: "LONG" | "SHORT",
+    closeQty: number,
+    fillPrice: number,
+    multiplier: number,
+    fallbackEntry: number,
+    fallbackOpenedAt: Date | undefined,
+  ): Promise<number> {
+    const dir = side === "LONG" ? 1 : -1;
+    const realizedOf = (entry: number, q: number) => Math.round((fillPrice - entry) * q * dir * multiplier * 100) / 100;
+    let remaining = closeQty;
+    let total = 0;
+    const { rows } = await client.query<{ id: string; quantity: number; entryPrice: string; openedAt: Date }>(
+      `SELECT "id","quantity","entryPrice","openedAt" FROM "PositionLot"
+       WHERE "accountId" = $1 AND "symbol" = $2 ORDER BY "openedAt" ASC, "id" ASC`,
       [accountId, symbol],
     );
     for (const lot of rows) {
       if (remaining <= 0) break;
       const lotQty = Number(lot.quantity);
       const take = Math.min(remaining, lotQty);
+      const entry = Number(lot.entryPrice);
+      const realized = realizedOf(entry, take);
+      total += realized;
+      // One closed-trade row per lot — its real entry price + open time, not the blend.
+      await this.recordClosedPosition(client, accountId, symbol, side, take, entry, fillPrice, realized, lot.openedAt);
       if (take >= lotQty) {
         await client.query(`DELETE FROM "PositionLot" WHERE "id" = $1`, [lot.id]);
       } else {
@@ -615,6 +627,14 @@ export class OrderEngine {
       }
       remaining -= take;
     }
+    // Defensive: lots didn't fully back the position — book the remainder at the position
+    // average so the closed-trades log and realized P&L stay complete.
+    if (remaining > 0) {
+      const realized = realizedOf(fallbackEntry, remaining);
+      total += realized;
+      await this.recordClosedPosition(client, accountId, symbol, side, remaining, fallbackEntry, fillPrice, realized, fallbackOpenedAt);
+    }
+    return Math.round(total * 100) / 100;
   }
 
   /** Append a closed-position record (one per realizing close/reduce/flip). */
