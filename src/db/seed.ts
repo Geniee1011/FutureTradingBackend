@@ -121,6 +121,7 @@ export async function runSeed(): Promise<void> {
     // Demo positions + orders so the trade page shows DB-backed data
     // (until the order engine writes these itself). Reset, then insert.
     await pool.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
+    await pool.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1`, [accountId]);
     await pool.query(`DELETE FROM "Order" WHERE "accountId" = $1`, [accountId]);
 
     // Price the demo positions near the LIVE mark (fetched above) so each one's
@@ -146,6 +147,12 @@ export async function runSeed(): Promise<void> {
         `INSERT INTO "Position" ("accountId","symbol","side","quantity","averagePrice","realizedPnl")
          VALUES ($1,$2,$3,$4,$5,$6)`,
         [accountId, p.symbol, p.side, p.qty, p.avg, 0],
+      );
+      // Mirror as a single open lot so the admin per-trade Positions view shows it too.
+      await pool.query(
+        `INSERT INTO "PositionLot" ("accountId","symbol","side","quantity","entryPrice")
+         VALUES ($1,$2,$3,$4,$5)`,
+        [accountId, p.symbol, p.side, p.qty, p.avg],
       );
     }
 

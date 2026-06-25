@@ -512,6 +512,8 @@ export class OrderEngine {
          VALUES ($1,$2,$3,$4,$5)`,
         [accountId, symbol, side === "buy" ? "LONG" : "SHORT", qty, round(fillPrice)],
       );
+      // First lot of a brand-new position (admin CRM lists trades separately).
+      await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice));
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty} ${symbol} @ ${round(fillPrice)}`);
       return 0;
     }
@@ -526,6 +528,9 @@ export class OrderEngine {
         `UPDATE "Position" SET "quantity" = $2, "averagePrice" = $3, "updatedAt" = now() WHERE "id" = $1`,
         [existing.id, newQty, newAvg],
       );
+      // A scale-in is a SEPARATE trade in the CRM — record its own lot (not merged
+      // into the existing one), even though the netted Position line above averages them.
+      await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice));
       return 0;
     }
 
@@ -555,8 +560,12 @@ export class OrderEngine {
         existing.quantity - qty,
         realized,
       ]);
+      // Partial reduce: consume the oldest open lots (FIFO) by the closed quantity.
+      await this.consumeLots(client, accountId, symbol, qty);
     } else if (qty === existing.quantity) {
       await client.query(`DELETE FROM "Position" WHERE "id" = $1`, [existing.id]);
+      // Flat → all lots for this symbol are closed.
+      await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2`, [accountId, symbol]);
       await this.log(client, accountId, "POSITION_CLOSED", `${symbol} flat (realized ${realized})`);
     } else {
       // Flip to the opposite side with the remainder.
@@ -564,10 +573,48 @@ export class OrderEngine {
         `UPDATE "Position" SET "side" = $2, "quantity" = $3, "averagePrice" = $4, "realizedPnl" = "realizedPnl" + $5, "updatedAt" = now() WHERE "id" = $1`,
         [existing.id, side === "buy" ? "LONG" : "SHORT", qty - existing.quantity, round(fillPrice), realized],
       );
+      // Old direction fully closed; the remainder opens a fresh lot on the new side.
+      await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2`, [accountId, symbol]);
+      await this.insertLot(client, accountId, symbol, side, qty - existing.quantity, round(fillPrice));
       await this.log(client, accountId, "POSITION_CLOSED", `${existing.side.toLowerCase()} ${symbol} closed (realized ${realized})`);
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty - existing.quantity} ${symbol} @ ${round(fillPrice)}`);
     }
     return realized;
+  }
+
+  /** Record one open lot — a single entry trade — for the per-trade admin CRM view. */
+  private async insertLot(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    side: ApiSide,
+    qty: number,
+    entryPrice: number,
+  ): Promise<void> {
+    await client.query(
+      `INSERT INTO "PositionLot" ("accountId","symbol","side","quantity","entryPrice") VALUES ($1,$2,$3,$4,$5)`,
+      [accountId, symbol, side === "buy" ? "LONG" : "SHORT", qty, entryPrice],
+    );
+  }
+
+  /** Reduce the oldest open lots (FIFO) by a total quantity, deleting fully-consumed lots. */
+  private async consumeLots(client: PoolClient, accountId: string, symbol: string, qty: number): Promise<void> {
+    let remaining = qty;
+    const { rows } = await client.query<{ id: string; quantity: number }>(
+      `SELECT "id","quantity" FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2 ORDER BY "openedAt" ASC, "id" ASC`,
+      [accountId, symbol],
+    );
+    for (const lot of rows) {
+      if (remaining <= 0) break;
+      const lotQty = Number(lot.quantity);
+      const take = Math.min(remaining, lotQty);
+      if (take >= lotQty) {
+        await client.query(`DELETE FROM "PositionLot" WHERE "id" = $1`, [lot.id]);
+      } else {
+        await client.query(`UPDATE "PositionLot" SET "quantity" = "quantity" - $2 WHERE "id" = $1`, [lot.id, take]);
+      }
+      remaining -= take;
+    }
   }
 
   /** Append a closed-position record (one per realizing close/reduce/flip). */

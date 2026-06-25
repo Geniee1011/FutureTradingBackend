@@ -272,6 +272,10 @@ export class AccountStream {
   /** Engine hook: push an order update to the owning account's subscribers. */
   publishOrderUpdate(accountId: string, order: unknown) {
     this.sendToAccountChannel(accountId, "orders", { type: "order_update", channel: "orders", order });
+    // Every order/bracket/fill/cancel flows through here, so it's the single chokepoint
+    // to also nudge admin dashboards live — e.g. so a trader's TP/SL add/change appears
+    // on the admin Positions table immediately, with no manual refresh.
+    this.publishAdminUpdate({ kind: "trade_activity", accountId });
   }
 
   /** Engine hook: push an admin event to all admin subscribers. */

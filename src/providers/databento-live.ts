@@ -32,6 +32,12 @@ const BOOK_QUOTE_THROTTLE_MS = 400;
 // getHistory, closing that seam — and the buffer survives frontend reloads.
 const LIVE_BAR_CAP = 1500; // ~25h of 1-minute bars per symbol
 const HIST_CACHE_TTL_MS = 60_000; // re-fetch a symbol's historical backfill at most once/min
+// On a COLD cache (no bars yet — a fresh or just-reaped per-user session), briefly
+// wait for the background backfill so the very FIRST response already carries the
+// deep history instead of a live-only sliver (the empty-chart cold-start gap). Bounded
+// so a genuinely slow/rate-limited Historical hop still returns promptly (live-only)
+// and keeps warming in the background for the next poll.
+const HIST_COLD_WAIT_MS = 8_000;
 
 interface SymState {
   price: number;
@@ -65,7 +71,9 @@ export class DatabentoLiveProvider extends BaseProvider {
   // ONCE in the background, cache it, and serve it instantly thereafter — the
   // chart never waits on (or is blanked by) a slow historical request.
   private histCache = new Map<string, { at: number; bars: Candle[] }>();
-  private histInflight = new Set<string>();
+  // In-flight backfill per `${symbol}:${resolutionSec}`. A Promise (not a bare flag)
+  // so a cold getHistory can AWAIT the active fetch and serve it on the first call.
+  private histInflight = new Map<string, Promise<void>>();
   private streaming = false;
   private textBuf: Buffer = Buffer.alloc(0);
   private running = false;
@@ -114,13 +122,18 @@ export class DatabentoLiveProvider extends BaseProvider {
     const inst = getInstrument(symbol);
     if (!inst) return [];
     const key = `${symbol}:${resolutionSec}`;
-    const cached = this.histCache.get(key);
-    // Warm (or refresh) the cache in the BACKGROUND — never block the chart
-    // response on the slow Historical hop. The first call returns live-only; once
-    // the background fetch lands, subsequent calls (the frontend re-polls) serve
-    // full history. TTL 60s keeps it fresh without hammering the link.
+    let cached = this.histCache.get(key);
+    // Warm (or refresh) the cache. A WARM-but-stale cache refreshes in the BACKGROUND
+    // (never blocks — the slow Historical hop deepens silently). A COLD cache briefly
+    // AWAITS the fetch (bounded) so the first response already carries the full backfill
+    // rather than a live-only sliver; if the hop is too slow it returns live-only and the
+    // background fetch lands for the next poll. TTL 60s keeps a warm cache fresh.
     if (!cached || Date.now() - cached.at > HIST_CACHE_TTL_MS) {
-      void this.refreshHistory(symbol, resolutionSec, count, inst);
+      const refresh = this.refreshHistory(symbol, resolutionSec, count, inst);
+      if (!cached) {
+        await Promise.race([refresh, sleep(HIST_COLD_WAIT_MS)]);
+        cached = this.histCache.get(key);
+      }
     }
     const hist = cached?.bars ?? [];
     // The live buffer is minute-grained, so it can only extend resolutions >= 1m.
@@ -139,25 +152,31 @@ export class DatabentoLiveProvider extends BaseProvider {
    * — a slow Historical hop is acceptable here because it doesn't block the chart;
    * it just needs to land once, after which the cache serves it instantly.
    */
-  private async refreshHistory(symbol: string, resolutionSec: number, count: number, inst: ReturnType<typeof getInstrument>): Promise<void> {
-    if (!inst) return;
+  private refreshHistory(symbol: string, resolutionSec: number, count: number, inst: ReturnType<typeof getInstrument>): Promise<void> {
+    if (!inst) return Promise.resolve();
     const key = `${symbol}:${resolutionSec}`;
-    if (this.histInflight.has(key)) return;
-    this.histInflight.add(key);
-    try {
-      const bars = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision, {
-        retries: 1,
-        timeoutMs: 60_000,
-      });
-      if (bars.length) {
-        this.histCache.set(key, { at: Date.now(), bars });
-        this.logRecovered();
+    // De-dupe: concurrent callers (a cold getHistory awaiting + the background poll)
+    // share the SAME fetch promise, so we never run two backfills for one key.
+    const existing = this.histInflight.get(key);
+    if (existing) return existing;
+    const p = (async () => {
+      try {
+        const bars = await fetchHistory(this.client, inst.databentoSymbol, resolutionSec, count, inst.pricePrecision, {
+          retries: 1,
+          timeoutMs: 60_000,
+        });
+        if (bars.length) {
+          this.histCache.set(key, { at: Date.now(), bars });
+          this.logRecovered();
+        }
+      } catch (err) {
+        this.logError(err, `history ${symbol} ${resolutionSec}s (background backfill — chart shows live bars meanwhile)`);
+      } finally {
+        this.histInflight.delete(key);
       }
-    } catch (err) {
-      this.logError(err, `history ${symbol} ${resolutionSec}s (background backfill — chart shows live bars meanwhile)`);
-    } finally {
-      this.histInflight.delete(key);
-    }
+    })();
+    this.histInflight.set(key, p);
+    return p;
   }
 
   /** Resolve each root's current dated contract code (e.g. ES → ESM6). */
@@ -492,4 +511,9 @@ export class DatabentoLiveProvider extends BaseProvider {
     this.failing = false;
     console.log("[live] connection recovered");
   }
+}
+
+/** Resolve after `ms` — used to bound the cold-cache wait in getHistory. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }

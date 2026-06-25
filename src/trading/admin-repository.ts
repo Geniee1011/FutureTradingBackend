@@ -240,6 +240,10 @@ export interface AdminOpenPosition {
   realizedPnl: number;
   unrealizedPnl: number;
   openedAt: number;
+  // Protective bracket levels (the position's open OCO exit legs), or null if none set.
+  // Derived fresh per query, so a later add/edit by the trader shows on the next refresh.
+  stopLoss: number | null;
+  takeProfit: number | null;
 }
 
 export interface AdminClosedPosition {
@@ -259,28 +263,54 @@ export interface AdminClosedPosition {
 
 /** Every OPEN position across all accounts (admin-wide Positions view). */
 export async function adminListOpenPositions(): Promise<AdminOpenPosition[]> {
+  // The internal CRM lists every entry trade SEPARATELY, so we read per-trade lots
+  // (not the netted Position line the trader dashboard shows). Each lot keeps its own
+  // entry price + open time; the protective bracket is per-symbol (shared by the lots),
+  // and the netted position's unrealized P&L is split across its lots by quantity.
   const { rows } = await getPool().query(
-    `SELECT p."id", p."symbol", p."side", p."quantity", p."averagePrice",
-            p."realizedPnl", p."unrealizedPnl", p."openedAt", p."accountId",
-            u."id" AS "traderId", u."name", u."email"
-     FROM "Position" p
-     JOIN "Account" a ON a."id" = p."accountId"
+    `SELECT l."id", l."symbol", l."side", l."quantity", l."entryPrice", l."openedAt", l."accountId",
+            u."id" AS "traderId", u."name", u."email",
+            p."quantity" AS "posQty", p."unrealizedPnl" AS "posUnrealized",
+            -- Per-symbol protective bracket = the open OCO exit legs (SL=STOP, TP=LIMIT).
+            -- One bracket per symbol (old legs are cancelled on replace), so LIMIT 1 is exact.
+            (SELECT o."requestedPrice" FROM "Order" o
+              WHERE o."accountId" = l."accountId" AND o."symbol" = l."symbol"
+                AND o."status" = 'PENDING' AND o."ocoGroupId" IS NOT NULL AND o."type" = 'STOP'
+              ORDER BY o."updatedAt" DESC LIMIT 1) AS "stopLoss",
+            (SELECT o."requestedPrice" FROM "Order" o
+              WHERE o."accountId" = l."accountId" AND o."symbol" = l."symbol"
+                AND o."status" = 'PENDING' AND o."ocoGroupId" IS NOT NULL AND o."type" = 'LIMIT'
+              ORDER BY o."updatedAt" DESC LIMIT 1) AS "takeProfit"
+     FROM "PositionLot" l
+     JOIN "Account" a ON a."id" = l."accountId"
      JOIN "User" u ON u."id" = a."userId"
-     ORDER BY p."openedAt" DESC`,
+     LEFT JOIN "Position" p ON p."accountId" = l."accountId" AND p."symbol" = l."symbol"
+     ORDER BY l."openedAt" DESC`,
   );
-  return rows.map((r) => ({
-    id: r.id,
-    traderId: r.traderId,
-    traderName: r.name ?? r.email,
-    accountId: r.accountId,
-    symbol: r.symbol,
-    side: r.side,
-    quantity: Number(r.quantity),
-    averagePrice: Number(r.averagePrice),
-    realizedPnl: Number(r.realizedPnl),
-    unrealizedPnl: Number(r.unrealizedPnl),
-    openedAt: ms(r.openedAt),
-  }));
+  return rows.map((r) => {
+    const lotQty = Number(r.quantity);
+    const posQty = r.posQty != null ? Number(r.posQty) : lotQty;
+    const posUnreal = r.posUnrealized != null ? Number(r.posUnrealized) : 0;
+    // Split the netted unrealized P&L across lots by size so the per-trade rows still
+    // sum to the position total. Realized is booked only on close (→ ClosedPosition),
+    // so an open lot's booked realized is 0.
+    const unrealizedPnl = posQty > 0 ? Math.round(posUnreal * (lotQty / posQty) * 100) / 100 : 0;
+    return {
+      id: r.id,
+      traderId: r.traderId,
+      traderName: r.name ?? r.email,
+      accountId: r.accountId,
+      symbol: r.symbol,
+      side: r.side,
+      quantity: lotQty,
+      averagePrice: Number(r.entryPrice),
+      realizedPnl: 0,
+      unrealizedPnl,
+      openedAt: ms(r.openedAt),
+      stopLoss: r.stopLoss != null ? Number(r.stopLoss) : null,
+      takeProfit: r.takeProfit != null ? Number(r.takeProfit) : null,
+    };
+  });
 }
 
 /** Every CLOSED position across all accounts, newest first (admin-wide Positions view). */
@@ -607,6 +637,7 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
     // orders, transactions, violations, closed positions, activity — is KEPT so admins can
     // still see every challenge. The trader's own views are scoped by challengeStartedAt.
     await client.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
+    await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1`, [accountId]); // per-trade lots are live state too
     await client.query(
       `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'Challenge reset', "updatedAt" = now()
        WHERE "accountId" = $1 AND "status" = 'PENDING'`,

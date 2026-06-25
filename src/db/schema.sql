@@ -169,3 +169,28 @@ CREATE TABLE IF NOT EXISTS "ClosedPosition" (
 );
 CREATE INDEX IF NOT EXISTS "ClosedPosition_accountId_closedAt_idx" ON "ClosedPosition" ("accountId","closedAt");
 CREATE INDEX IF NOT EXISTS "ClosedPosition_closedAt_idx" ON "ClosedPosition" ("closedAt");
+
+-- Per-trade OPEN lots. The live "Position" row nets every fill of a symbol into one
+-- averaged line (what the trader dashboard shows). The internal admin CRM instead needs
+-- each entry trade listed separately, so every entry fill records its own lot here;
+-- opposing fills consume the oldest lots first (FIFO). Invariant: for one (account,symbol)
+-- the lots are all the position's side and their quantities sum to the netted quantity.
+CREATE TABLE IF NOT EXISTS "PositionLot" (
+  "id"         text PRIMARY KEY DEFAULT gen_random_uuid()::text,
+  "accountId"  text NOT NULL REFERENCES "Account"("id") ON DELETE CASCADE,
+  "symbol"     text NOT NULL,
+  "side"       "PositionSide" NOT NULL,
+  "quantity"   integer NOT NULL,
+  "entryPrice" numeric(18,4) NOT NULL,
+  "openedAt"   timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS "PositionLot_account_symbol_idx" ON "PositionLot" ("accountId","symbol","openedAt");
+
+-- Backfill: existing open positions (pre-dating lot tracking) become a single lot each,
+-- so they keep showing in the admin view. Only seeds symbols that have no lots yet.
+INSERT INTO "PositionLot" ("accountId","symbol","side","quantity","entryPrice","openedAt")
+SELECT p."accountId", p."symbol", p."side", p."quantity", p."averagePrice", p."openedAt"
+FROM "Position" p
+WHERE NOT EXISTS (
+  SELECT 1 FROM "PositionLot" l WHERE l."accountId" = p."accountId" AND l."symbol" = p."symbol"
+);
