@@ -204,6 +204,10 @@ ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "stopLossRequired"         boolean  
 ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "minHoldTimeSecs"          integer     NOT NULL DEFAULT 0;
 ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "overnightHoldsProhibited" boolean     NOT NULL DEFAULT false;
 ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "weekendHoldsProhibited"   boolean     NOT NULL DEFAULT false;
+-- Drawdown style: 'INTRADAY' = trailing floor ratchets in real time on unrealized P&L
+-- (challenge accounts); 'EOD' = floor only updates once at session close, using the
+-- highest intraday equity reached that day (funded accounts).
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "drawdownType"            text        NOT NULL DEFAULT 'INTRADAY';
 
 -- Daily-limit pause (closes positions + blocks new orders for the rest of the trading day).
 -- Does NOT fail the challenge — the account stays ACTIVE; the date clears automatically
@@ -213,6 +217,14 @@ ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "tradingPausedAt" date;
 -- Which evaluation phase (1 or 2) this account is currently in. Phase 1 → Phase 2
 -- on auto-advance; Phase 2 PASSED goes to manual admin review for funded upgrade.
 ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "challengePhase" smallint NOT NULL DEFAULT 1;
+
+-- EOD trailing drawdown state.
+-- peakIntradayEquity: highest equity (balance + unrealized) reached in the CURRENT
+--   session; resets each day. Used to snapshot the EOD peak at session close.
+-- eodPeakEquity: the banked end-of-day peak — the basis for the EOD floor
+--   (floor = eodPeakEquity - maxDrawdown), fixed for the whole trading day.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "peakIntradayEquity" numeric(18,2);
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "eodPeakEquity"      numeric(18,2);
 
 -- Global rule templates: one row per account tier. Admin edits these and the
 -- changes cascade to every Account.ruleTemplateId-linked per-account Rule row.
@@ -235,6 +247,7 @@ CREATE TABLE IF NOT EXISTS "RuleTemplate" (
   "minHoldTimeSecs"    integer NOT NULL DEFAULT 0,
   "overnightHoldsProhibited" boolean NOT NULL DEFAULT false,
   "weekendHoldsProhibited"   boolean NOT NULL DEFAULT false,
+  "drawdownType"       text NOT NULL DEFAULT 'INTRADAY',
   "allowedInstruments" text[] NOT NULL DEFAULT '{}',
   "updatedAt"          timestamptz NOT NULL DEFAULT now()
 );
@@ -248,6 +261,7 @@ ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "stopLossRequired"         b
 ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "minHoldTimeSecs"          integer     NOT NULL DEFAULT 0;
 ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "overnightHoldsProhibited" boolean     NOT NULL DEFAULT false;
 ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "weekendHoldsProhibited"   boolean     NOT NULL DEFAULT false;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "drawdownType"             text        NOT NULL DEFAULT 'INTRADAY';
 
 -- Seed / refresh the 9 standard account tiers with spec-correct values.
 -- DO UPDATE so a fresh deploy always applies the latest spec values; admins
@@ -256,18 +270,18 @@ INSERT INTO "RuleTemplate" (
   "id","label","phase","accountSize","sortOrder",
   "maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
   "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
-  "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited"
+  "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited","drawdownType"
 ) VALUES
---                                                         dly   dd    tgt  ctrs  days  pct   risk   units  sl    secs  ovnt  wknd
-  ('c1_50k',  'Challenge Phase 1 — $50,000',  'Challenge Phase 1', 50000,    1, 1000,  2000,  1500, 3, 5, 30,  500,  3.0, true,  15, true,  true),
-  ('c1_100k', 'Challenge Phase 1 — $100,000', 'Challenge Phase 1', 100000,   2, 2000,  4000,  3000, 3, 5, 30,  1000, 3.0, true,  15, true,  true),
-  ('c2_50k',  'Challenge Phase 2 — $50,000',  'Challenge Phase 2', 50000,    3, 1000,  1500,  3000, 3, 5, 30,  500,  3.0, true,  15, true,  true),
-  ('c2_100k', 'Challenge Phase 2 — $100,000', 'Challenge Phase 2', 100000,   4, 2000,  3000,  6000, 3, 5, 30,  1000, 3.0, true,  15, true,  true),
-  ('f_50k',   'Funded — $50,000',             'Funded',            50000,    5, 1000,  2000,  5000,   5, 10, 30,  250,   5.0, true,  15, true,  true),
-  ('f_100k',  'Funded — $100,000',            'Funded',            100000,   6, 2000,  4000,  10000,  8, 10, 30,  500,   8.0, true,  15, true,  true),
-  ('f_250k',  'Funded — $250,000',            'Funded',            250000,   7, 5000,  10000, 25000, 15, 10, 30,  1250, 15.0, true,  15, true,  true),
-  ('f_500k',  'Funded — $500,000',            'Funded',            500000,   8, 10000, 20000, 50000, 20, 10, 30,  2500, 20.0, true,  15, true,  true),
-  ('f_1m',    'Funded — $1,000,000',          'Funded',            1000000,  9, 20000, 40000, 100000,30, 10, 30,  5000, 30.0, true,  15, true,  true)
+--                                                         dly   dd    tgt  ctrs  days  pct   risk   units  sl    secs  ovnt  wknd  ddType
+  ('c1_50k',  'Challenge Phase 1 — $50,000',  'Challenge Phase 1', 50000,    1, 1000,  2000,  1500, 3, 5, 30,  500,  3.0, true,  15, true,  true, 'INTRADAY'),
+  ('c1_100k', 'Challenge Phase 1 — $100,000', 'Challenge Phase 1', 100000,   2, 2000,  4000,  3000, 3, 5, 30,  1000, 3.0, true,  15, true,  true, 'INTRADAY'),
+  ('c2_50k',  'Challenge Phase 2 — $50,000',  'Challenge Phase 2', 50000,    3, 1000,  1500,  3000, 3, 5, 30,  500,  3.0, true,  15, true,  true, 'INTRADAY'),
+  ('c2_100k', 'Challenge Phase 2 — $100,000', 'Challenge Phase 2', 100000,   4, 2000,  3000,  6000, 3, 5, 30,  1000, 3.0, true,  15, true,  true, 'INTRADAY'),
+  ('f_50k',   'Funded — $50,000',             'Funded',            50000,    5, 1000,  2000,  5000,   5, 10, 30,  250,   5.0, true,  15, true,  true, 'EOD'),
+  ('f_100k',  'Funded — $100,000',            'Funded',            100000,   6, 2000,  4000,  10000,  8, 10, 30,  500,   8.0, true,  15, true,  true, 'EOD'),
+  ('f_250k',  'Funded — $250,000',            'Funded',            250000,   7, 5000,  10000, 25000, 15, 10, 30,  1250, 15.0, true,  15, true,  true, 'EOD'),
+  ('f_500k',  'Funded — $500,000',            'Funded',            500000,   8, 10000, 20000, 50000, 20, 10, 30,  2500, 20.0, true,  15, true,  true, 'EOD'),
+  ('f_1m',    'Funded — $1,000,000',          'Funded',            1000000,  9, 20000, 40000, 100000,30, 10, 30,  5000, 30.0, true,  15, true,  true, 'EOD')
 ON CONFLICT ("id") DO UPDATE SET
   "maxDailyLoss"            = EXCLUDED."maxDailyLoss",
   "maxDrawdown"             = EXCLUDED."maxDrawdown",
@@ -280,7 +294,8 @@ ON CONFLICT ("id") DO UPDATE SET
   "stopLossRequired"        = EXCLUDED."stopLossRequired",
   "minHoldTimeSecs"         = EXCLUDED."minHoldTimeSecs",
   "overnightHoldsProhibited"= EXCLUDED."overnightHoldsProhibited",
-  "weekendHoldsProhibited"  = EXCLUDED."weekendHoldsProhibited";
+  "weekendHoldsProhibited"  = EXCLUDED."weekendHoldsProhibited",
+  "drawdownType"            = EXCLUDED."drawdownType";
 
 -- Link each Account to the tier whose rules it inherits.
 -- Set at account creation / upgrade; cascade propagates template edits to per-account Rule rows.

@@ -415,7 +415,7 @@ async function handleAdminRuleUpdate(url: URL, req: IncomingMessage, res: Server
 async function handleAdminRuleTemplateUpdate(url: URL, req: IncomingMessage, res: ServerResponse) {
   if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
   const id = url.pathname.split("/")[4]!; // /api/admin/rule-templates/:id
-  const body = await readJson<{ maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number; allowedInstruments?: string[] }>(req);
+  const body = await readJson<Parameters<typeof adminUpdateRuleTemplate>[1]>(req);
   if (!body) return json(res, 400, { error: "body required" });
   const ok = await adminUpdateRuleTemplate(id, body);
   json(res, ok ? 200 : 400, { ok, error: ok ? undefined : "template not found or no valid fields" });

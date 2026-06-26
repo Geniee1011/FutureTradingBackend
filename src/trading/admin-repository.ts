@@ -653,6 +653,7 @@ export interface AdminRuleTemplate {
   minHoldTimeSecs: number;
   overnightHoldsProhibited: boolean;
   weekendHoldsProhibited: boolean;
+  drawdownType: string; // 'INTRADAY' | 'EOD'
   allowedInstruments: string[];
   updatedAt: number;
 }
@@ -663,7 +664,7 @@ export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
     `SELECT "id","label","phase","accountSize","sortOrder","maxDailyLoss","maxDrawdown",
             "profitTarget","maxContracts","minTradingDays","maxDailyProfitPct",
             "maxRiskPerTrade","maxPositionUnits","stopLossRequired","minHoldTimeSecs",
-            "overnightHoldsProhibited","weekendHoldsProhibited","allowedInstruments","updatedAt"
+            "overnightHoldsProhibited","weekendHoldsProhibited","drawdownType","allowedInstruments","updatedAt"
      FROM "RuleTemplate" ORDER BY "sortOrder"`,
   );
   return rows.map((r) => ({
@@ -684,6 +685,7 @@ export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
     minHoldTimeSecs: Number(r.minHoldTimeSecs),
     overnightHoldsProhibited: Boolean(r.overnightHoldsProhibited),
     weekendHoldsProhibited: Boolean(r.weekendHoldsProhibited),
+    drawdownType: (r.drawdownType as string) ?? "INTRADAY",
     allowedInstruments: (r.allowedInstruments as string[] | null) ?? [],
     updatedAt: new Date(r.updatedAt).getTime(),
   }));
@@ -696,7 +698,7 @@ const NUM_FIELDS  = ["maxDailyLoss", "maxDrawdown", "profitTarget", "maxContract
 type TemplateFields = Partial<
   Record<typeof NUM_FIELDS[number], number> &
   Record<typeof BOOL_FIELDS[number], boolean> &
-  { allowedInstruments: string[] }
+  { allowedInstruments: string[]; drawdownType: string }
 >;
 
 /** Update a template and cascade the same values to every linked account's Rule row. */
@@ -714,6 +716,10 @@ export async function adminUpdateRuleTemplate(id: string, fields: TemplateFields
     if (fields[k] == null) continue;
     cols.push(`"${k}" = $${vals.length + 1}`);
     vals.push(Boolean(fields[k]));
+  }
+  if (fields.drawdownType === "INTRADAY" || fields.drawdownType === "EOD") {
+    cols.push(`"drawdownType" = $${vals.length + 1}`);
+    vals.push(fields.drawdownType);
   }
   if (Array.isArray(fields.allowedInstruments)) {
     const list = fields.allowedInstruments.filter((s) => typeof s === "string");
@@ -768,6 +774,8 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
       `UPDATE "Account" SET "balance" = "startingBalance", "equity" = "startingBalance",
               "dailyPnl" = 0, "totalPnl" = 0, "drawdown" = 0, "highestEquity" = "startingBalance",
               "dayStartEquity" = "startingBalance", "dayStartAt" = CURRENT_DATE,
+              "peakIntradayEquity" = "startingBalance", "eodPeakEquity" = "startingBalance",
+              "tradingPausedAt" = NULL,
               "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
       [accountId],
     );

@@ -29,10 +29,13 @@ interface EvalRow {
   dayStartEquity: string | null;
   dayStartAt: Date | string | null;
   tradingPausedAt: Date | string | null;
+  peakIntradayEquity: string | null;
+  eodPeakEquity: string | null;
   maxDailyLoss: string | null;
   maxDrawdown: string | null;
   profitTarget: string | null;
   minTradingDays: number | null;
+  drawdownType: string | null;
 }
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
@@ -60,7 +63,8 @@ export class RiskEngine {
     const { rows } = await getPool().query<EvalRow>(
       `SELECT a."status", a."challengePhase", a."startingBalance", a."highestEquity",
               a."dayStartEquity", a."dayStartAt", a."tradingPausedAt",
-              r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."minTradingDays"
+              a."peakIntradayEquity", a."eodPeakEquity",
+              r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."minTradingDays", r."drawdownType"
        FROM "Account" a LEFT JOIN "Rule" r ON r."accountId" = a."id"
        WHERE a."id" = $1`,
       [accountId],
@@ -74,10 +78,36 @@ export class RiskEngine {
     const rolled = !sameDay;
     const dayStartEquity = sameDay && a.dayStartEquity != null ? Number(a.dayStartEquity) : equity;
 
-    const peak = Math.max(Number(a.highestEquity), equity); // trailing high-water mark
-    const drawdown = round2(Math.max(0, peak - equity));
+    const peak = Math.max(Number(a.highestEquity), equity); // all-time real-time high-water mark
     const dailyLoss = round2(Math.max(0, dayStartEquity - equity));
     const profit = round2(equity - startingBalance);
+
+    const maxDailyLoss = a.maxDailyLoss != null ? Number(a.maxDailyLoss) : 0;
+    const maxDrawdown  = a.maxDrawdown  != null ? Number(a.maxDrawdown)  : 0;
+    const profitTarget = a.profitTarget != null ? Number(a.profitTarget) : 0;
+    const minTradingDays = a.minTradingDays ?? 0;
+    const drawdownType = a.drawdownType ?? "INTRADAY";
+
+    // ---- EOD trailing drawdown state ----
+    // The session's running intraday peak (highest equity reached today). On a day
+    // rollover, the PRIOR session's intraday peak is banked into the EOD peak — this is
+    // the "session close" snapshot — then the intraday peak restarts at the current equity.
+    let eodPeak = a.eodPeakEquity != null ? Number(a.eodPeakEquity) : startingBalance;
+    const priorIntraday = a.peakIntradayEquity != null ? Number(a.peakIntradayEquity) : startingBalance;
+    let peakIntraday: number;
+    if (rolled) {
+      if (priorIntraday > eodPeak) eodPeak = priorIntraday; // session close: bank the day's high
+      peakIntraday = equity; // new session — seed the intraday peak at the opening equity
+    } else {
+      peakIntraday = Math.max(priorIntraday, equity); // track the running high during the session
+    }
+
+    // The drawdown that matters depends on the account's drawdown style:
+    //   INTRADAY → floor ratchets in real time off the all-time peak (challenge accounts)
+    //   EOD      → floor is fixed for the day at (banked EOD peak − maxDrawdown) (funded accounts)
+    const isEod = drawdownType === "EOD";
+    const drawdownRef = isEod ? eodPeak : peak; // basis for the floor
+    const drawdown = round2(Math.max(0, drawdownRef - equity));
 
     // Keep the live account fields fresh.
     // On a new day, reset the realized daily figure and clear the trading-pause flag.
@@ -86,15 +116,12 @@ export class RiskEngine {
               "dayStartEquity" = $5, "dayStartAt" = $6::date,
               "dailyPnl" = CASE WHEN $7 THEN 0 ELSE "dailyPnl" END,
               "tradingPausedAt" = CASE WHEN $7 THEN NULL ELSE "tradingPausedAt" END,
+              "peakIntradayEquity" = $8, "eodPeakEquity" = $9,
               "updatedAt" = now()
        WHERE "id" = $1`,
-      [accountId, round2(equity), drawdown, round2(peak), round2(dayStartEquity), today, rolled],
+      [accountId, round2(equity), drawdown, round2(peak), round2(dayStartEquity), today, rolled,
+       round2(peakIntraday), round2(eodPeak)],
     );
-
-    const maxDailyLoss = a.maxDailyLoss != null ? Number(a.maxDailyLoss) : 0;
-    const maxDrawdown  = a.maxDrawdown  != null ? Number(a.maxDrawdown)  : 0;
-    const profitTarget = a.profitTarget != null ? Number(a.profitTarget) : 0;
-    const minTradingDays = a.minTradingDays ?? 0;
 
     // Skip daily-limit re-evaluation if already paused today.
     const alreadyPaused = a.tradingPausedAt != null && dateStr(a.tradingPausedAt) === today;
@@ -103,8 +130,11 @@ export class RiskEngine {
       // Daily loss hit → close positions + pause for today. Challenge stays ACTIVE.
       await this.applyDailyLimitPause(accountId, dailyLoss, maxDailyLoss);
     } else if (maxDrawdown > 0 && drawdown >= maxDrawdown) {
-      // Trailing drawdown breached → FAIL the challenge (terminal).
-      await this.terminate(accountId, "FAILED", "MAX_DRAWDOWN_BREACHED", `Drawdown $${drawdown} reached limit $${maxDrawdown}`);
+      // Drawdown floor breached → FAIL the challenge (terminal). Floor basis differs by type.
+      const floor = round2(drawdownRef - maxDrawdown);
+      const label = isEod ? "EOD trailing drawdown" : "Trailing drawdown";
+      await this.terminate(accountId, "FAILED", "MAX_DRAWDOWN_BREACHED",
+        `${label}: equity $${round2(equity)} fell to/below floor $${floor} (limit $${maxDrawdown})`);
     } else if (profitTarget > 0 && profit >= profitTarget) {
       // Profit target hit — check additional conditions before passing.
       await this.checkAndPass(accountId, profit, profitTarget, minTradingDays, Number(a.challengePhase));
@@ -210,6 +240,7 @@ export class RiskEngine {
            SET "balance" = $2, "equity" = $2, "dailyPnl" = 0, "totalPnl" = 0,
                "drawdown" = 0, "highestEquity" = $2,
                "dayStartEquity" = $2, "dayStartAt" = CURRENT_DATE,
+               "peakIntradayEquity" = $2, "eodPeakEquity" = $2,
                "tradingPausedAt" = NULL, "challengePhase" = 2,
                "challengeStartedAt" = now(), "ruleTemplateId" = COALESCE($3, "ruleTemplateId"),
                "updatedAt" = now()
