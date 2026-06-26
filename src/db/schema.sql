@@ -194,3 +194,94 @@ FROM "Position" p
 WHERE NOT EXISTS (
   SELECT 1 FROM "PositionLot" l WHERE l."accountId" = p."accountId" AND l."symbol" = p."symbol"
 );
+
+-- ---- Extended per-account rule fields (added v2) ----
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "minTradingDays"           integer     NOT NULL DEFAULT 5;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "maxDailyProfitPct"        numeric(5,2) NOT NULL DEFAULT 30;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "maxRiskPerTrade"          numeric(18,2) NOT NULL DEFAULT 0;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "maxPositionUnits"         numeric(5,1) NOT NULL DEFAULT 0;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "stopLossRequired"         boolean     NOT NULL DEFAULT false;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "minHoldTimeSecs"          integer     NOT NULL DEFAULT 0;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "overnightHoldsProhibited" boolean     NOT NULL DEFAULT false;
+ALTER TABLE "Rule" ADD COLUMN IF NOT EXISTS "weekendHoldsProhibited"   boolean     NOT NULL DEFAULT false;
+
+-- Daily-limit pause (closes positions + blocks new orders for the rest of the trading day).
+-- Does NOT fail the challenge — the account stays ACTIVE; the date clears automatically
+-- at the next day boundary.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "tradingPausedAt" date;
+
+-- Which evaluation phase (1 or 2) this account is currently in. Phase 1 → Phase 2
+-- on auto-advance; Phase 2 PASSED goes to manual admin review for funded upgrade.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "challengePhase" smallint NOT NULL DEFAULT 1;
+
+-- Global rule templates: one row per account tier. Admin edits these and the
+-- changes cascade to every Account.ruleTemplateId-linked per-account Rule row.
+-- The risk engine still reads per-account Rule rows (no risk-engine change needed).
+CREATE TABLE IF NOT EXISTS "RuleTemplate" (
+  "id"                 text PRIMARY KEY,
+  "label"              text NOT NULL,
+  "phase"              text NOT NULL,
+  "accountSize"        numeric(18,2) NOT NULL,
+  "sortOrder"          integer NOT NULL DEFAULT 0,
+  "maxDailyLoss"       numeric(18,2) NOT NULL,
+  "maxDrawdown"        numeric(18,2) NOT NULL,
+  "profitTarget"       numeric(18,2) NOT NULL DEFAULT 0,
+  "maxContracts"       integer NOT NULL DEFAULT 3,
+  "minTradingDays"     integer NOT NULL DEFAULT 5,
+  "maxDailyProfitPct"  numeric(5,2) NOT NULL DEFAULT 30,
+  "maxRiskPerTrade"    numeric(18,2) NOT NULL DEFAULT 0,
+  "maxPositionUnits"   numeric(5,1) NOT NULL DEFAULT 0,
+  "stopLossRequired"   boolean NOT NULL DEFAULT false,
+  "minHoldTimeSecs"    integer NOT NULL DEFAULT 0,
+  "overnightHoldsProhibited" boolean NOT NULL DEFAULT false,
+  "weekendHoldsProhibited"   boolean NOT NULL DEFAULT false,
+  "allowedInstruments" text[] NOT NULL DEFAULT '{}',
+  "updatedAt"          timestamptz NOT NULL DEFAULT now()
+);
+
+-- ---- Extended RuleTemplate fields (mirrors Rule additions above) ----
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "minTradingDays"           integer     NOT NULL DEFAULT 5;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "maxDailyProfitPct"        numeric(5,2) NOT NULL DEFAULT 30;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "maxRiskPerTrade"          numeric(18,2) NOT NULL DEFAULT 0;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "maxPositionUnits"         numeric(5,1) NOT NULL DEFAULT 0;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "stopLossRequired"         boolean     NOT NULL DEFAULT false;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "minHoldTimeSecs"          integer     NOT NULL DEFAULT 0;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "overnightHoldsProhibited" boolean     NOT NULL DEFAULT false;
+ALTER TABLE "RuleTemplate" ADD COLUMN IF NOT EXISTS "weekendHoldsProhibited"   boolean     NOT NULL DEFAULT false;
+
+-- Seed / refresh the 9 standard account tiers with spec-correct values.
+-- DO UPDATE so a fresh deploy always applies the latest spec values; admins
+-- can still override via the UI (values reset on next deploy — expected during setup).
+INSERT INTO "RuleTemplate" (
+  "id","label","phase","accountSize","sortOrder",
+  "maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+  "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+  "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited"
+) VALUES
+--                                                         dly   dd    tgt  ctrs  days  pct   risk   units  sl    secs  ovnt  wknd
+  ('c1_50k',  'Challenge Phase 1 — $50,000',  'Challenge Phase 1', 50000,    1, 1000,  2000,  1500, 3, 5, 30,  500,  3.0, true,  15, true,  true),
+  ('c1_100k', 'Challenge Phase 1 — $100,000', 'Challenge Phase 1', 100000,   2, 2000,  4000,  3000, 3, 5, 30,  1000, 3.0, true,  15, true,  true),
+  ('c2_50k',  'Challenge Phase 2 — $50,000',  'Challenge Phase 2', 50000,    3, 1000,  1500,  3000, 3, 5, 30,  500,  3.0, true,  15, true,  true),
+  ('c2_100k', 'Challenge Phase 2 — $100,000', 'Challenge Phase 2', 100000,   4, 2000,  3000,  6000, 3, 5, 30,  1000, 3.0, true,  15, true,  true),
+  ('f_50k',   'Funded — $50,000',             'Funded',            50000,    5, 1000,  2000,  0,    3, 0,  0,   0,    3.0, true,  15, true,  true),
+  ('f_100k',  'Funded — $100,000',            'Funded',            100000,   6, 2000,  4000,  0,    3, 0,  0,   0,    3.0, true,  15, true,  true),
+  ('f_250k',  'Funded — $250,000',            'Funded',            250000,   7, 5000,  10000, 0,    10,0,  0,   0,    10.0,true,  15, true,  true),
+  ('f_500k',  'Funded — $500,000',            'Funded',            500000,   8, 10000, 20000, 0,    20,0,  0,   0,    20.0,true,  15, true,  true),
+  ('f_1m',    'Funded — $1,000,000',          'Funded',            1000000,  9, 20000, 40000, 0,    40,0,  0,   0,    40.0,true,  15, true,  true)
+ON CONFLICT ("id") DO UPDATE SET
+  "maxDailyLoss"            = EXCLUDED."maxDailyLoss",
+  "maxDrawdown"             = EXCLUDED."maxDrawdown",
+  "profitTarget"            = EXCLUDED."profitTarget",
+  "maxContracts"            = EXCLUDED."maxContracts",
+  "minTradingDays"          = EXCLUDED."minTradingDays",
+  "maxDailyProfitPct"       = EXCLUDED."maxDailyProfitPct",
+  "maxRiskPerTrade"         = EXCLUDED."maxRiskPerTrade",
+  "maxPositionUnits"        = EXCLUDED."maxPositionUnits",
+  "stopLossRequired"        = EXCLUDED."stopLossRequired",
+  "minHoldTimeSecs"         = EXCLUDED."minHoldTimeSecs",
+  "overnightHoldsProhibited"= EXCLUDED."overnightHoldsProhibited",
+  "weekendHoldsProhibited"  = EXCLUDED."weekendHoldsProhibited";
+
+-- Link each Account to the tier whose rules it inherits.
+-- Set at account creation / upgrade; cascade propagates template edits to per-account Rule rows.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "ruleTemplateId" text REFERENCES "RuleTemplate"("id");

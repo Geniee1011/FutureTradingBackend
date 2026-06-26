@@ -35,12 +35,14 @@ import {
   adminListClosedPositions,
   adminListOpenPositions,
   adminListRules,
+  adminListRuleTemplates,
   adminListTraders,
   adminListViolations,
   adminResetAccount,
   adminSetAccountStatus,
   adminSetTraderStatus,
   adminUpdateRule,
+  adminUpdateRuleTemplate,
   logActivity,
   type AdminAction,
 } from "../trading/admin-repository.js";
@@ -211,6 +213,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
       closed: await adminListClosedPositions(500),
     }));
   if (url.pathname === "/api/admin/rules" && req.method === "GET") return handleAdmin(req, res, adminListRules);
+  if (url.pathname === "/api/admin/rule-templates" && req.method === "GET") return handleAdmin(req, res, adminListRuleTemplates);
+  if (/^\/api\/admin\/rule-templates\/[^/]+$/.test(url.pathname) && req.method === "POST")
+    return handleAdminRuleTemplateUpdate(url, req, res);
   if (/^\/api\/admin\/traders\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return handleAdminStatus(url, req, res, opts.accountStream, "trader");
   if (/^\/api\/admin\/traders\/[^/]+\/password$/.test(url.pathname) && req.method === "POST")
@@ -405,6 +410,15 @@ async function handleAdminRuleUpdate(url: URL, req: IncomingMessage, res: Server
   if (!body) return json(res, 400, { error: "body required" });
   const ok = await adminUpdateRule(accountId, body);
   json(res, ok ? 200 : 400, { ok, error: ok ? undefined : "no valid fields to update" });
+}
+
+async function handleAdminRuleTemplateUpdate(url: URL, req: IncomingMessage, res: ServerResponse) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const id = url.pathname.split("/")[4]!; // /api/admin/rule-templates/:id
+  const body = await readJson<{ maxDailyLoss?: number; maxDrawdown?: number; profitTarget?: number; maxContracts?: number; allowedInstruments?: string[] }>(req);
+  if (!body) return json(res, 400, { error: "body required" });
+  const ok = await adminUpdateRuleTemplate(id, body);
+  json(res, ok ? 200 : 400, { ok, error: ok ? undefined : "template not found or no valid fields" });
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;

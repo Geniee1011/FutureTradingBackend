@@ -58,3 +58,24 @@ export function getMultiplier(symbol: string): number {
 export function getByDatabentoSymbol(dbSymbol: string): Instrument | undefined {
   return byDatabento.get(dbSymbol);
 }
+
+/**
+ * Mini-equivalent weight for cross-instrument position-size enforcement.
+ * 1 mini = 1.0 unit; 1 micro = 0.1 unit (they are exactly 10× smaller).
+ * A limit of 3.0 mini-equivalents equals "3 minis OR 30 micros (or any combo)".
+ */
+const MICROS = new Set(["MES", "MNQ", "MYM", "MCL", "MGC"]);
+export function miniEquivalent(symbol: string): number {
+  return MICROS.has(symbol) ? 0.1 : 1.0;
+}
+
+/**
+ * Micro alternative for a mini (ES→MES, NQ→MNQ, …).
+ * Returns null for micros (already the smallest) and unknown symbols.
+ */
+const MINI_TO_MICRO: Record<string, string> = {
+  ES: "MES", NQ: "MNQ", YM: "MYM", CL: "MCL", GC: "MGC",
+};
+export function getMicroAlternative(symbol: string): string | null {
+  return MINI_TO_MICRO[symbol] ?? null;
+}

@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { getPool } from "../db/pool.js";
 import { useDatabase } from "../config.js";
-import { getInstrument, getMultiplier } from "../instruments.js";
+import { getInstrument, getMultiplier, getMicroAlternative, miniEquivalent } from "../instruments.js";
 import { isMarketOpen, MARKET_CLOSED_MESSAGE } from "./market-hours.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 
@@ -41,6 +41,8 @@ export interface PlaceResult {
   status?: string;
   fillPrice?: number | null;
   realizedPnl?: number;
+  /** Returned when the order is blocked by maxRiskPerTrade — shows the compliant micro alternative. */
+  suggestion?: { symbol: string; quantity: number; risk: number };
 }
 
 interface PositionRow {
@@ -104,9 +106,20 @@ export class OrderEngine {
     try {
       await client.query("BEGIN");
 
-      // Pre-trade risk: allowed instruments + max contracts (resulting net size).
-      const rule = await client.query<{ allowedInstruments: string[]; maxContracts: number; status: string }>(
-        `SELECT r."allowedInstruments", r."maxContracts", a."status"
+      // Pre-trade risk: allowed instruments + position limits + rule fields.
+      const rule = await client.query<{
+        allowedInstruments: string[];
+        maxContracts: number;
+        maxPositionUnits: number;
+        maxRiskPerTrade: number;
+        stopLossRequired: boolean;
+        minHoldTimeSecs: number;
+        status: string;
+        tradingPausedAt: Date | null;
+      }>(
+        `SELECT r."allowedInstruments", r."maxContracts", r."maxPositionUnits",
+                r."maxRiskPerTrade", r."stopLossRequired", r."minHoldTimeSecs",
+                a."status", a."tradingPausedAt"
          FROM "Account" a LEFT JOIN "Rule" r ON r."accountId" = a."id"
          WHERE a."id" = $1 FOR UPDATE OF a`,
         [accountId],
@@ -116,11 +129,33 @@ export class OrderEngine {
         await client.query("ROLLBACK");
         return { ok: false, error: await disabledAccountMessage(accountId, acc.status) };
       }
+
+      // Daily loss limit pause — clears automatically at the next day rollover.
+      const today = new Date().toISOString().slice(0, 10);
+      if (acc?.tradingPausedAt) {
+        const pausedDate = new Date(acc.tradingPausedAt).toISOString().slice(0, 10);
+        if (pausedDate === today) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "Daily loss limit reached. Trading is paused until the next trading day." };
+        }
+      }
+
       if (acc?.allowedInstruments?.length && !acc.allowedInstruments.includes(input.symbol)) {
         const detail = `${input.symbol} is not allowed on this account.`;
         await this.recordViolation(client, accountId, "RESTRICTED_INSTRUMENT", detail);
         await client.query("COMMIT"); // persist the violation (only SELECTs preceded it)
         return { ok: false, error: detail };
+      }
+
+      // Stop loss (and take profit) required before entering any position.
+      const stopLossRequired = acc?.stopLossRequired ?? false;
+      if (stopLossRequired && input.stopLoss == null) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "A stop loss is required before entering a position." };
+      }
+      if (stopLossRequired && input.takeProfit == null) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "A take profit is required before entering a position." };
       }
 
       const isMarket = input.type === "market";
@@ -133,6 +168,22 @@ export class OrderEngine {
       if (bErr) {
         await client.query("ROLLBACK");
         return { ok: false, error: bErr };
+      }
+
+      // Max risk per trade: |entryPrice - slPrice| × qty × multiplier.
+      // Only checked when a SL is provided (which is always the case when stopLossRequired).
+      const maxRiskPerTrade = acc?.maxRiskPerTrade ?? 0;
+      if (maxRiskPerTrade > 0 && slPrice != null) {
+        const impliedRisk = Math.abs(fillPrice - slPrice) * input.quantity * inst.multiplier;
+        if (impliedRisk > maxRiskPerTrade) {
+          const suggestion = computeMicroSuggestion(input.symbol, fillPrice, slPrice, maxRiskPerTrade);
+          await client.query("ROLLBACK");
+          return {
+            ok: false,
+            error: `This order risks $${Math.round(impliedRisk)} — your limit is $${maxRiskPerTrade}.`,
+            suggestion,
+          };
+        }
       }
 
       // Limit/stop → store as a working order; no fill yet. SL/TP ride along and
@@ -150,15 +201,28 @@ export class OrderEngine {
         return { ok: true, orderId: order.id, status: "PENDING", fillPrice: null };
       }
 
-      // Market order: check resulting position size against maxContracts.
+      // Market order: check resulting cross-instrument position size (mini-equivalents).
+      const maxPositionUnits = acc?.maxPositionUnits ?? 0;
       const existing = await this.getPosition(client, accountId, input.symbol);
-      const netAfter = this.netSizeAfter(existing, input.side, input.quantity);
-      if (acc?.maxContracts && netAfter > acc.maxContracts) {
-        const detail = `Order would exceed max position size (${acc.maxContracts} contracts).`;
-        await this.recordViolation(client, accountId, "CONTRACT_LIMIT_EXCEEDED", detail);
-        await client.query("COMMIT"); // persist the violation
-        return { ok: false, error: detail };
+      if (maxPositionUnits > 0) {
+        const unitsAfter = await this.totalPositionUnitsAfter(client, accountId, input.symbol, input.side, input.quantity);
+        if (unitsAfter > maxPositionUnits) {
+          const detail = `Order would exceed the max position size (${maxPositionUnits} mini-equivalents across all instruments).`;
+          await this.recordViolation(client, accountId, "CONTRACT_LIMIT_EXCEEDED", detail);
+          await client.query("COMMIT"); // persist the violation
+          return { ok: false, error: detail };
+        }
+      } else if (acc?.maxContracts) {
+        const netAfter = this.netSizeAfter(existing, input.side, input.quantity);
+        if (netAfter > acc.maxContracts) {
+          const detail = `Order would exceed max position size (${acc.maxContracts} contracts).`;
+          await this.recordViolation(client, accountId, "CONTRACT_LIMIT_EXCEEDED", detail);
+          await client.query("COMMIT"); // persist the violation
+          return { ok: false, error: detail };
+        }
       }
+
+      const minHoldTimeSecs = acc?.minHoldTimeSecs ?? 0;
 
       // Fill it: order + fill + position + account.
       const ord = await client.query<{ id: string }>(
@@ -169,6 +233,7 @@ export class OrderEngine {
       const orderId = ord.rows[0]!.id;
       const realized = await this.settleFill(
         client, accountId, orderId, input.symbol, input.side, input.quantity, fillPrice, inst.pricePrecision,
+        minHoldTimeSecs,
       );
       await this.log(client, accountId, "ORDER_FILLED", `${input.side} ${input.quantity} ${input.symbol} @ ${fillPrice}`);
 
@@ -493,6 +558,37 @@ export class OrderEngine {
     return Math.abs(cur + order);
   }
 
+  /**
+   * Sum of |position size × miniEquivalent| across ALL instruments for this account,
+   * applying the net change that `side qty` would produce on `symbol`.
+   * Used for cross-instrument position-size enforcement (maxPositionUnits).
+   */
+  private async totalPositionUnitsAfter(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    side: ApiSide,
+    qty: number,
+  ): Promise<number> {
+    const { rows } = await client.query<{ symbol: string; side: string; quantity: number }>(
+      `SELECT "symbol","side","quantity" FROM "Position" WHERE "accountId" = $1`,
+      [accountId],
+    );
+    // Sum existing positions (excluding the one being changed, added back below).
+    let total = 0;
+    for (const p of rows) {
+      if (p.symbol === symbol) continue; // handled separately
+      total += Number(p.quantity) * miniEquivalent(p.symbol);
+    }
+    // Apply the net effect of the new order on this symbol.
+    const existing = rows.find((p) => p.symbol === symbol);
+    const curNet = existing ? (existing.side === "LONG" ? 1 : -1) * Number(existing.quantity) : 0;
+    const orderNet = (side === "buy" ? 1 : -1) * qty;
+    const newNet = Math.abs(curNet + orderNet);
+    total += newNet * miniEquivalent(symbol);
+    return total;
+  }
+
   /** Net the fill into the position; returns realized P&L. Writes Position changes. */
   private async applyToPosition(
     client: PoolClient,
@@ -502,6 +598,7 @@ export class OrderEngine {
     qty: number,
     fillPrice: number,
     precision: number,
+    minHoldTimeSecs = 0,
   ): Promise<number> {
     const existing = await this.getPosition(client, accountId, symbol);
     const round = (v: number) => Math.round(v * 10 ** precision) / 10 ** precision;
@@ -543,6 +640,7 @@ export class OrderEngine {
     const realized = await this.closeLotsFifo(
       client, accountId, symbol, existing.side, closedQty, fillPrice,
       getMultiplier(symbol), existing.averagePrice, existing.openedAt,
+      minHoldTimeSecs,
     );
 
     if (qty < existing.quantity) {
@@ -601,9 +699,20 @@ export class OrderEngine {
     multiplier: number,
     fallbackEntry: number,
     fallbackOpenedAt: Date | undefined,
+    minHoldTimeSecs = 0,
   ): Promise<number> {
     const dir = side === "LONG" ? 1 : -1;
-    const realizedOf = (entry: number, q: number) => Math.round((fillPrice - entry) * q * dir * multiplier * 100) / 100;
+    const now = Date.now();
+    const realizedOf = (entry: number, q: number, openedAt: Date | undefined) => {
+      const pnl = Math.round((fillPrice - entry) * q * dir * multiplier * 100) / 100;
+      // Min-hold-time rule: if a trade is closed with profit before the minimum hold
+      // time, the profit does not count. A loss is always real.
+      if (minHoldTimeSecs > 0 && pnl > 0 && openedAt) {
+        const heldMs = now - new Date(openedAt).getTime();
+        if (heldMs < minHoldTimeSecs * 1000) return 0;
+      }
+      return pnl;
+    };
     let remaining = closeQty;
     let total = 0;
     const { rows } = await client.query<{ id: string; quantity: number; entryPrice: string; openedAt: Date }>(
@@ -616,7 +725,7 @@ export class OrderEngine {
       const lotQty = Number(lot.quantity);
       const take = Math.min(remaining, lotQty);
       const entry = Number(lot.entryPrice);
-      const realized = realizedOf(entry, take);
+      const realized = realizedOf(entry, take, lot.openedAt);
       total += realized;
       // One closed-trade row per lot — its real entry price + open time, not the blend.
       await this.recordClosedPosition(client, accountId, symbol, side, take, entry, fillPrice, realized, lot.openedAt);
@@ -630,7 +739,7 @@ export class OrderEngine {
     // Defensive: lots didn't fully back the position — book the remainder at the position
     // average so the closed-trades log and realized P&L stay complete.
     if (remaining > 0) {
-      const realized = realizedOf(fallbackEntry, remaining);
+      const realized = realizedOf(fallbackEntry, remaining, fallbackOpenedAt);
       total += realized;
       await this.recordClosedPosition(client, accountId, symbol, side, remaining, fallbackEntry, fillPrice, realized, fallbackOpenedAt);
     }
@@ -667,9 +776,10 @@ export class OrderEngine {
     qty: number,
     fillPrice: number,
     precision: number,
+    minHoldTimeSecs = 0,
   ): Promise<number> {
     await client.query(`INSERT INTO "Fill" ("orderId","quantity","price") VALUES ($1,$2,$3)`, [orderId, qty, fillPrice]);
-    const realized = await this.applyToPosition(client, accountId, symbol, side, qty, fillPrice, precision);
+    const realized = await this.applyToPosition(client, accountId, symbol, side, qty, fillPrice, precision, minHoldTimeSecs);
     if (realized !== 0) {
       await client.query(
         `UPDATE "Account" SET "balance" = "balance" + $2, "totalPnl" = "totalPnl" + $2,
@@ -743,9 +853,16 @@ export class OrderEngine {
         return;
       }
 
-      const rule = await client.query<{ maxContracts: number; status: string }>(
-        `SELECT r."maxContracts", a."status" FROM "Account" a
-         LEFT JOIN "Rule" r ON r."accountId" = a."id" WHERE a."id" = $1 FOR UPDATE OF a`,
+      const rule = await client.query<{
+        maxContracts: number;
+        maxPositionUnits: number;
+        minHoldTimeSecs: number;
+        status: string;
+        tradingPausedAt: Date | null;
+      }>(
+        `SELECT r."maxContracts", r."maxPositionUnits", r."minHoldTimeSecs",
+                a."status", a."tradingPausedAt"
+         FROM "Account" a LEFT JOIN "Rule" r ON r."accountId" = a."id" WHERE a."id" = $1 FOR UPDATE OF a`,
         [o.accountId],
       );
       const acc = rule.rows[0];
@@ -758,19 +875,44 @@ export class OrderEngine {
         return;
       }
 
-      const existing = await this.getPosition(client, o.accountId, o.symbol);
-      if (acc?.maxContracts && this.netSizeAfter(existing, side, qty) > acc.maxContracts) {
-        await this.rejectOrder(client, o, `exceeds max ${acc.maxContracts} contracts`, "CONTRACT_LIMIT_EXCEEDED");
-        await client.query("COMMIT");
-        this.accountStream.publishOrderUpdate(o.accountId, { id: o.id, status: "rejected", symbol: o.symbol });
-        return;
+      // Daily loss limit pause active — reject (not cancel) so the order stays visible.
+      const today = new Date().toISOString().slice(0, 10);
+      if (acc?.tradingPausedAt) {
+        const pausedDate = new Date(acc.tradingPausedAt).toISOString().slice(0, 10);
+        if (pausedDate === today) {
+          await this.rejectOrder(client, o, "daily loss limit: trading paused until tomorrow");
+          await client.query("COMMIT");
+          this.accountStream.publishOrderUpdate(o.accountId, { id: o.id, status: "rejected", symbol: o.symbol });
+          return;
+        }
       }
+
+      const maxPositionUnits = acc?.maxPositionUnits ?? 0;
+      if (maxPositionUnits > 0) {
+        const unitsAfter = await this.totalPositionUnitsAfter(client, o.accountId, o.symbol, side, qty);
+        if (unitsAfter > maxPositionUnits) {
+          await this.rejectOrder(client, o, `exceeds max ${maxPositionUnits} mini-equivalent units`, "CONTRACT_LIMIT_EXCEEDED");
+          await client.query("COMMIT");
+          this.accountStream.publishOrderUpdate(o.accountId, { id: o.id, status: "rejected", symbol: o.symbol });
+          return;
+        }
+      } else if (acc?.maxContracts) {
+        const existing = await this.getPosition(client, o.accountId, o.symbol);
+        if (this.netSizeAfter(existing, side, qty) > acc.maxContracts) {
+          await this.rejectOrder(client, o, `exceeds max ${acc.maxContracts} contracts`, "CONTRACT_LIMIT_EXCEEDED");
+          await client.query("COMMIT");
+          this.accountStream.publishOrderUpdate(o.accountId, { id: o.id, status: "rejected", symbol: o.symbol });
+          return;
+        }
+      }
+
+      const minHoldTimeSecs = acc?.minHoldTimeSecs ?? 0;
 
       await client.query(
         `UPDATE "Order" SET "status" = 'FILLED', "filledQuantity" = $2, "fillPrice" = $3, "updatedAt" = now() WHERE "id" = $1`,
         [o.id, qty, fillPrice],
       );
-      await this.settleFill(client, o.accountId, o.id, o.symbol, side, qty, fillPrice, inst.pricePrecision);
+      await this.settleFill(client, o.accountId, o.id, o.symbol, side, qty, fillPrice, inst.pricePrecision, minHoldTimeSecs);
       await this.log(client, o.accountId, "ORDER_FILLED", `${side} ${qty} ${o.symbol} @ ${fillPrice} (${o.type.toLowerCase()})`);
 
       // OCO: this leg filled → cancel its sibling. (A bracket exit leg has an ocoGroupId.)
@@ -864,4 +1006,27 @@ function bracketError(side: ApiSide, ref: number, sl: number | null, tp: number 
     if (buy ? tp <= ref : tp >= ref) return `Take profit must be ${buy ? "above" : "below"} the entry price.`;
   }
   return null;
+}
+
+/**
+ * Compute the micro-contract alternative when a mini order exceeds maxRiskPerTrade.
+ * Returns { symbol, quantity, risk } for the micro with the largest qty that fits,
+ * or null if the symbol has no micro alternative or if even 1 micro exceeds the limit.
+ */
+function computeMicroSuggestion(
+  symbol: string,
+  fillPrice: number,
+  slPrice: number,
+  maxRisk: number,
+): PlaceResult["suggestion"] {
+  const microSymbol = getMicroAlternative(symbol);
+  if (!microSymbol) return undefined;
+  const distance = Math.abs(fillPrice - slPrice);
+  if (distance === 0) return undefined;
+  const microMultiplier = getMultiplier(microSymbol);
+  const riskPer1 = distance * microMultiplier;
+  if (riskPer1 <= 0) return undefined;
+  const qty = Math.floor(maxRisk / riskPer1);
+  if (qty <= 0) return undefined;
+  return { symbol: microSymbol, quantity: qty, risk: Math.round(qty * riskPer1 * 100) / 100 };
 }

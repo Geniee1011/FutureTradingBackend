@@ -633,6 +633,110 @@ export async function adminUpdateRule(
   return (res.rowCount ?? 0) > 0;
 }
 
+// ----------------------------- rule templates -----------------------------
+
+export interface AdminRuleTemplate {
+  id: string;
+  label: string;
+  phase: string;
+  accountSize: number;
+  sortOrder: number;
+  maxDailyLoss: number;
+  maxDrawdown: number;
+  profitTarget: number;
+  maxContracts: number;
+  minTradingDays: number;
+  maxDailyProfitPct: number;
+  maxRiskPerTrade: number;
+  maxPositionUnits: number;
+  stopLossRequired: boolean;
+  minHoldTimeSecs: number;
+  overnightHoldsProhibited: boolean;
+  weekendHoldsProhibited: boolean;
+  allowedInstruments: string[];
+  updatedAt: number;
+}
+
+/** All 9 global account-tier rule templates, ordered by sort position. */
+export async function adminListRuleTemplates(): Promise<AdminRuleTemplate[]> {
+  const { rows } = await getPool().query(
+    `SELECT "id","label","phase","accountSize","sortOrder","maxDailyLoss","maxDrawdown",
+            "profitTarget","maxContracts","minTradingDays","maxDailyProfitPct",
+            "maxRiskPerTrade","maxPositionUnits","stopLossRequired","minHoldTimeSecs",
+            "overnightHoldsProhibited","weekendHoldsProhibited","allowedInstruments","updatedAt"
+     FROM "RuleTemplate" ORDER BY "sortOrder"`,
+  );
+  return rows.map((r) => ({
+    id: r.id,
+    label: r.label,
+    phase: r.phase,
+    accountSize: Number(r.accountSize),
+    sortOrder: r.sortOrder,
+    maxDailyLoss: Number(r.maxDailyLoss),
+    maxDrawdown: Number(r.maxDrawdown),
+    profitTarget: Number(r.profitTarget),
+    maxContracts: Number(r.maxContracts),
+    minTradingDays: Number(r.minTradingDays),
+    maxDailyProfitPct: Number(r.maxDailyProfitPct),
+    maxRiskPerTrade: Number(r.maxRiskPerTrade),
+    maxPositionUnits: Number(r.maxPositionUnits),
+    stopLossRequired: Boolean(r.stopLossRequired),
+    minHoldTimeSecs: Number(r.minHoldTimeSecs),
+    overnightHoldsProhibited: Boolean(r.overnightHoldsProhibited),
+    weekendHoldsProhibited: Boolean(r.weekendHoldsProhibited),
+    allowedInstruments: (r.allowedInstruments as string[] | null) ?? [],
+    updatedAt: new Date(r.updatedAt).getTime(),
+  }));
+}
+
+const BOOL_FIELDS = ["stopLossRequired", "overnightHoldsProhibited", "weekendHoldsProhibited"] as const;
+const NUM_FIELDS  = ["maxDailyLoss", "maxDrawdown", "profitTarget", "maxContracts",
+                     "minTradingDays", "maxDailyProfitPct", "maxRiskPerTrade", "maxPositionUnits",
+                     "minHoldTimeSecs"] as const;
+type TemplateFields = Partial<
+  Record<typeof NUM_FIELDS[number], number> &
+  Record<typeof BOOL_FIELDS[number], boolean> &
+  { allowedInstruments: string[] }
+>;
+
+/** Update a template and cascade the same values to every linked account's Rule row. */
+export async function adminUpdateRuleTemplate(id: string, fields: TemplateFields): Promise<boolean> {
+  const cols: string[] = [];
+  const vals: unknown[] = [id];
+
+  for (const k of NUM_FIELDS) {
+    const v = fields[k];
+    if (v == null || !Number.isFinite(Number(v)) || Number(v) < 0) continue;
+    cols.push(`"${k}" = $${vals.length + 1}`);
+    vals.push(Number(v));
+  }
+  for (const k of BOOL_FIELDS) {
+    if (fields[k] == null) continue;
+    cols.push(`"${k}" = $${vals.length + 1}`);
+    vals.push(Boolean(fields[k]));
+  }
+  if (Array.isArray(fields.allowedInstruments)) {
+    const list = fields.allowedInstruments.filter((s) => typeof s === "string");
+    cols.push(`"allowedInstruments" = $${vals.length + 1}`);
+    vals.push(list);
+  }
+  if (cols.length === 0) return false;
+
+  const res = await getPool().query(
+    `UPDATE "RuleTemplate" SET ${cols.join(", ")}, "updatedAt" = now() WHERE "id" = $1`,
+    vals,
+  );
+  if ((res.rowCount ?? 0) === 0) return false;
+
+  // Cascade to every per-account Rule that belongs to this template.
+  await getPool().query(
+    `UPDATE "Rule" SET ${cols.join(", ")}, "updatedAt" = now()
+     WHERE "accountId" IN (SELECT "id" FROM "Account" WHERE "ruleTemplateId" = $1)`,
+    vals,
+  );
+  return true;
+}
+
 /** Reset an evaluation account to its day-1 state: wipe positions/orders/violations,
  *  reset the ledger to a single opening deposit, and restore balance/status. */
 export async function adminResetAccount(accountId: string): Promise<boolean> {
