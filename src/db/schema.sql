@@ -263,11 +263,11 @@ INSERT INTO "RuleTemplate" (
   ('c1_100k', 'Challenge Phase 1 — $100,000', 'Challenge Phase 1', 100000,   2, 2000,  4000,  3000, 3, 5, 30,  1000, 3.0, true,  15, true,  true),
   ('c2_50k',  'Challenge Phase 2 — $50,000',  'Challenge Phase 2', 50000,    3, 1000,  1500,  3000, 3, 5, 30,  500,  3.0, true,  15, true,  true),
   ('c2_100k', 'Challenge Phase 2 — $100,000', 'Challenge Phase 2', 100000,   4, 2000,  3000,  6000, 3, 5, 30,  1000, 3.0, true,  15, true,  true),
-  ('f_50k',   'Funded — $50,000',             'Funded',            50000,    5, 1000,  2000,  0,    3, 0,  0,   0,    3.0, true,  15, true,  true),
-  ('f_100k',  'Funded — $100,000',            'Funded',            100000,   6, 2000,  4000,  0,    3, 0,  0,   0,    3.0, true,  15, true,  true),
-  ('f_250k',  'Funded — $250,000',            'Funded',            250000,   7, 5000,  10000, 0,    10,0,  0,   0,    10.0,true,  15, true,  true),
-  ('f_500k',  'Funded — $500,000',            'Funded',            500000,   8, 10000, 20000, 0,    20,0,  0,   0,    20.0,true,  15, true,  true),
-  ('f_1m',    'Funded — $1,000,000',          'Funded',            1000000,  9, 20000, 40000, 0,    40,0,  0,   0,    40.0,true,  15, true,  true)
+  ('f_50k',   'Funded — $50,000',             'Funded',            50000,    5, 1000,  2000,  5000,   5, 10, 30,  250,   5.0, true,  15, true,  true),
+  ('f_100k',  'Funded — $100,000',            'Funded',            100000,   6, 2000,  4000,  10000,  8, 10, 30,  500,   8.0, true,  15, true,  true),
+  ('f_250k',  'Funded — $250,000',            'Funded',            250000,   7, 5000,  10000, 25000, 15, 10, 30,  1250, 15.0, true,  15, true,  true),
+  ('f_500k',  'Funded — $500,000',            'Funded',            500000,   8, 10000, 20000, 50000, 20, 10, 30,  2500, 20.0, true,  15, true,  true),
+  ('f_1m',    'Funded — $1,000,000',          'Funded',            1000000,  9, 20000, 40000, 100000,30, 10, 30,  5000, 30.0, true,  15, true,  true)
 ON CONFLICT ("id") DO UPDATE SET
   "maxDailyLoss"            = EXCLUDED."maxDailyLoss",
   "maxDrawdown"             = EXCLUDED."maxDrawdown",
