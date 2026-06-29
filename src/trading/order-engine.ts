@@ -32,6 +32,8 @@ export interface PlaceOrderInput {
 /** Options for order placement; `bypassMarketHours` is for system/admin paths only. */
 export interface PlaceOptions {
   bypassMarketHours?: boolean;
+  /** Closing/reducing an existing position — skips entry-only checks (SL required, max risk). */
+  reduceOnly?: boolean;
 }
 
 export interface PlaceResult {
@@ -147,13 +149,24 @@ export class OrderEngine {
         return { ok: false, error: detail };
       }
 
-      // Stop loss (and take profit) required before entering any position.
+      // Is this order reducing/closing an existing position? Such orders are exits, not
+      // entries — they must bypass the entry-only gates (stop-loss required, max risk per
+      // trade). An order reduces when it opposes the current position side; an explicit
+      // reduceOnly flag (close-position / admin / risk liquidation paths) forces it too.
+      const existing = await this.getPosition(client, accountId, input.symbol);
+      const reduceOnly =
+        opts?.reduceOnly === true ||
+        (existing != null &&
+          ((existing.side === "LONG" && input.side === "sell") ||
+            (existing.side === "SHORT" && input.side === "buy")));
+
+      // Stop loss (and take profit) required before ENTERING a position (not when exiting).
       const stopLossRequired = acc?.stopLossRequired ?? false;
-      if (stopLossRequired && input.stopLoss == null) {
+      if (!reduceOnly && stopLossRequired && input.stopLoss == null) {
         await client.query("ROLLBACK");
         return { ok: false, error: "A stop loss is required before entering a position." };
       }
-      if (stopLossRequired && input.takeProfit == null) {
+      if (!reduceOnly && stopLossRequired && input.takeProfit == null) {
         await client.query("ROLLBACK");
         return { ok: false, error: "A take profit is required before entering a position." };
       }
@@ -171,9 +184,9 @@ export class OrderEngine {
       }
 
       // Max risk per trade: |entryPrice - slPrice| × qty × multiplier.
-      // Only checked when a SL is provided (which is always the case when stopLossRequired).
+      // Entry-only — skipped when reducing/closing.
       const maxRiskPerTrade = acc?.maxRiskPerTrade ?? 0;
-      if (maxRiskPerTrade > 0 && slPrice != null) {
+      if (!reduceOnly && maxRiskPerTrade > 0 && slPrice != null) {
         const impliedRisk = Math.abs(fillPrice - slPrice) * input.quantity * inst.multiplier;
         if (impliedRisk > maxRiskPerTrade) {
           const suggestion = computeMicroSuggestion(input.symbol, fillPrice, slPrice, maxRiskPerTrade);
@@ -202,9 +215,10 @@ export class OrderEngine {
       }
 
       // Market order: check resulting cross-instrument position size (mini-equivalents).
+      // (`existing` was fetched above for reduce-only detection.) Reducing orders only
+      // ever shrink exposure, so the size cap can't be breached by them.
       const maxPositionUnits = acc?.maxPositionUnits ?? 0;
-      const existing = await this.getPosition(client, accountId, input.symbol);
-      if (maxPositionUnits > 0) {
+      if (!reduceOnly && maxPositionUnits > 0) {
         const unitsAfter = await this.totalPositionUnitsAfter(client, accountId, input.symbol, input.side, input.quantity);
         if (unitsAfter > maxPositionUnits) {
           const detail = `Order would exceed the max position size (${maxPositionUnits} mini-equivalents across all instruments).`;
@@ -212,7 +226,7 @@ export class OrderEngine {
           await client.query("COMMIT"); // persist the violation
           return { ok: false, error: detail };
         }
-      } else if (acc?.maxContracts) {
+      } else if (!reduceOnly && acc?.maxContracts) {
         const netAfter = this.netSizeAfter(existing, input.side, input.quantity);
         if (netAfter > acc.maxContracts) {
           const detail = `Order would exceed max position size (${acc.maxContracts} contracts).`;
@@ -267,7 +281,8 @@ export class OrderEngine {
     const pos = rows[0];
     if (!pos) return { ok: false, error: "No open position to close." };
     const side: ApiSide = pos.side === "LONG" ? "sell" : "buy";
-    const result = await this.place(accountId, { symbol, side, type: "market", quantity: Number(pos.quantity) }, opts);
+    // Closing is an exit — force reduceOnly so entry gates (SL required, max risk) don't block it.
+    const result = await this.place(accountId, { symbol, side, type: "market", quantity: Number(pos.quantity) }, { ...opts, reduceOnly: true });
     // Flat now → any resting SL/TP legs for this symbol are moot; cancel them.
     if (result.ok) await this.cancelBracketsForSymbol(accountId, symbol);
     return result;
