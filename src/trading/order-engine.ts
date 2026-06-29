@@ -27,6 +27,14 @@ export interface PlaceOrderInput {
   /** Optional bracket: on entry fill, place an opposing stop (SL) / limit (TP), OCO-linked. */
   stopLoss?: number | null;
   takeProfit?: number | null;
+  /**
+   * Optional bracket as a POSITIVE price distance from the actual entry. Preferred for
+   * market orders: the bracket is anchored to the real fill price (computed server-side),
+   * so e.g. 30 ticks SL / 30 ticks TP stay exactly symmetric even if the fill slips a tick
+   * or two from the quote shown when the trader clicked. Overrides stopLoss/takeProfit.
+   */
+  slOffset?: number | null;
+  tpOffset?: number | null;
 }
 
 /** Options for order placement; `bypassMarketHours` is for system/admin paths only. */
@@ -161,12 +169,15 @@ export class OrderEngine {
             (existing.side === "SHORT" && input.side === "buy")));
 
       // Stop loss (and take profit) required before ENTERING a position (not when exiting).
+      // A bracket leg counts whether it's given as an absolute price OR a tick offset.
       const stopLossRequired = acc?.stopLossRequired ?? false;
-      if (!reduceOnly && stopLossRequired && input.stopLoss == null) {
+      const hasSl = input.stopLoss != null || (input.slOffset != null && input.slOffset > 0);
+      const hasTp = input.takeProfit != null || (input.tpOffset != null && input.tpOffset > 0);
+      if (!reduceOnly && stopLossRequired && !hasSl) {
         await client.query("ROLLBACK");
         return { ok: false, error: "A stop loss is required before entering a position." };
       }
-      if (!reduceOnly && stopLossRequired && input.takeProfit == null) {
+      if (!reduceOnly && stopLossRequired && !hasTp) {
         await client.query("ROLLBACK");
         return { ok: false, error: "A take profit is required before entering a position." };
       }
@@ -174,9 +185,18 @@ export class OrderEngine {
       const isMarket = input.type === "market";
       const fillPrice = isMarket ? mark! : (input.price as number);
 
+      // Resolve the bracket prices. Offsets (positive distances) are PREFERRED and are
+      // anchored to the actual entry/fill price, so symmetric ticks stay symmetric even
+      // when a market order fills a tick or two off the quote the trader saw. Absolute
+      // stopLoss/takeProfit are used only when no offset is supplied (e.g. chart drags).
+      const buy = input.side === "buy";
+      const roundPx = (v: number) => Math.round(v * 10 ** inst.pricePrecision) / 10 ** inst.pricePrecision;
+      let slPrice = input.stopLoss != null ? Number(input.stopLoss) : null;
+      let tpPrice = input.takeProfit != null ? Number(input.takeProfit) : null;
+      if (input.slOffset != null && input.slOffset > 0) slPrice = roundPx(buy ? fillPrice - input.slOffset : fillPrice + input.slOffset);
+      if (input.tpOffset != null && input.tpOffset > 0) tpPrice = roundPx(buy ? fillPrice + input.tpOffset : fillPrice - input.tpOffset);
+
       // Validate the bracket (SL/TP) against the entry reference price.
-      const slPrice = input.stopLoss != null ? Number(input.stopLoss) : null;
-      const tpPrice = input.takeProfit != null ? Number(input.takeProfit) : null;
       const bErr = bracketError(input.side, fillPrice, slPrice, tpPrice);
       if (bErr) {
         await client.query("ROLLBACK");

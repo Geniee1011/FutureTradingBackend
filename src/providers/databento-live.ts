@@ -116,7 +116,10 @@ export class DatabentoLiveProvider extends BaseProvider {
     this.running = true;
     this.lastRecordAt = Date.now();
     void this.resolveIds();
-    void this.pollDaily();
+    // Daily stats first (quick — gives quotes a price), then eagerly warm the 1-minute
+    // historical backfill so a chart opened soon after boot already has full candles
+    // instead of a live-only sliver. Both use the slow Historical hop, so sequence them.
+    void this.pollDaily().then(() => this.prewarmHistory()).catch(() => {});
     this.scheduleDaily();
     this.connect();
     if (!this.watchdogTimer) this.watchdogTimer = setInterval(() => this.checkFeedHealth(), WATCHDOG_MS);
@@ -436,6 +439,28 @@ export class DatabentoLiveProvider extends BaseProvider {
       if (this.running) this.dailyTimer = setTimeout(tick, DAILY_POLL_MS);
     };
     this.dailyTimer = setTimeout(tick, DAILY_POLL_MS);
+  }
+
+  /**
+   * Warm the historical backfill at startup so a chart opened soon after boot already
+   * shows full candles. Without this, a fresh server has an empty Historical cache, so
+   * the first getHistory returns only the live-built sliver (a couple of bars) until the
+   * background fetch lands a minute later — that's the "few candles → fills in" cold start.
+   * Default 1-minute resolution only (the usual first view); coarser frames warm on demand.
+   * Throttled to a 3-worker pool so it never starves an on-demand chart request.
+   */
+  private async prewarmHistory(): Promise<void> {
+    const RES = 60; // 1-minute — the default chart resolution
+    const COUNT = 9600; // matches the frontend's 1m request so the cache is complete
+    const queue = [...INSTRUMENTS];
+    const worker = async () => {
+      for (;;) {
+        const inst = queue.shift();
+        if (!inst) return;
+        await this.refreshHistory(inst.symbol, RES, COUNT, inst).catch(() => {});
+      }
+    };
+    await Promise.all([worker(), worker(), worker()]);
   }
 
   private async pollDaily(): Promise<void> {
