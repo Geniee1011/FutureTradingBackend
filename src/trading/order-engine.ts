@@ -364,8 +364,8 @@ export class OrderEngine {
     const client = await getPool().connect();
     try {
       await client.query("BEGIN");
-      const lock = await client.query<{ status: string; accountId: string; symbol: string; side: string; type: string; quantity: number }>(
-        `SELECT "status","accountId","symbol","side","type","quantity" FROM "Order" WHERE "id" = $1 FOR UPDATE`,
+      const lock = await client.query<{ status: string; accountId: string; symbol: string; side: string; type: string; quantity: number; ocoGroupId: string | null }>(
+        `SELECT "status","accountId","symbol","side","type","quantity","ocoGroupId" FROM "Order" WHERE "id" = $1 FOR UPDATE`,
         [orderId],
       );
       const row = lock.rows[0];
@@ -377,6 +377,13 @@ export class OrderEngine {
       if (row.status !== "PENDING") {
         await client.query("ROLLBACK");
         return { ok: false, error: `Order is ${row.status.toLowerCase()} and can no longer be cancelled.` };
+      }
+
+      // A protective exit leg (SL/TP) of an OPEN position can be moved but not removed
+      // when the account requires brackets — traders must always keep both in a trade.
+      if (row.ocoGroupId != null && (await this.hasOpenPosition(client, accountId, row.symbol)) && (await this.requiresBracket(client, accountId))) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "Your stop loss and take profit can be moved but not removed while you're in a position." };
       }
 
       await client.query(
@@ -412,10 +419,10 @@ export class OrderEngine {
     try {
       await client.query("BEGIN");
       const lock = await client.query<{
-        status: string; accountId: string; symbol: string; side: string; type: string;
+        status: string; accountId: string; symbol: string; side: string; type: string; quantity: number;
         requestedPrice: string | null; ocoGroupId: string | null; slPrice: string | null; tpPrice: string | null;
       }>(
-        `SELECT "status","accountId","symbol","side","type","requestedPrice","ocoGroupId","slPrice","tpPrice"
+        `SELECT "status","accountId","symbol","side","type","quantity","requestedPrice","ocoGroupId","slPrice","tpPrice"
          FROM "Order" WHERE "id" = $1 FOR UPDATE`,
         [orderId],
       );
@@ -450,6 +457,25 @@ export class OrderEngine {
       let newTp = row.tpPrice != null ? Number(row.tpPrice) : null;
       if (changes.stopLoss !== undefined) newSl = changes.stopLoss == null ? null : Number(changes.stopLoss);
       if (changes.takeProfit !== undefined) newTp = changes.takeProfit == null ? null : Number(changes.takeProfit);
+
+      // Re-enforce max risk per trade when (re)setting the bracket on a PENDING ENTRY order.
+      // Moving the SL or the entry price must keep the implied risk within the cap — the
+      // order hasn't filled, so the entry-time check still applies. (Exit legs of an OPEN
+      // position are intentionally exempt: a trader may widen the stop on a live trade.)
+      if (!isExitLeg && newPrice != null && newSl != null) {
+        const { rows: rr } = await client.query<{ maxRiskPerTrade: string | null }>(
+          `SELECT r."maxRiskPerTrade" FROM "Rule" r WHERE r."accountId" = $1`,
+          [accountId],
+        );
+        const maxRiskPerTrade = rr[0]?.maxRiskPerTrade != null ? Number(rr[0].maxRiskPerTrade) : 0;
+        if (maxRiskPerTrade > 0) {
+          const impliedRisk = Math.abs(newPrice - newSl) * Number(row.quantity) * getMultiplier(row.symbol);
+          if (impliedRisk > maxRiskPerTrade) {
+            await client.query("ROLLBACK");
+            return { ok: false, error: `This stop risks $${Math.round(impliedRisk)} — your limit is $${maxRiskPerTrade}.` };
+          }
+        }
+      }
 
       // Validate the bracket against the (new) entry price on an entry order.
       if (!isExitLeg && newPrice != null) {
@@ -527,6 +553,13 @@ export class OrderEngine {
       const newSl = changes.stopLoss !== undefined ? (changes.stopLoss == null ? null : Number(changes.stopLoss)) : curSl;
       const newTp = changes.takeProfit !== undefined ? (changes.takeProfit == null ? null : Number(changes.takeProfit)) : curTp;
 
+      // When the account requires brackets, both legs must stay in place while in a position —
+      // they can be moved (new price) but not removed (null). `pos` exists here, so we're in a trade.
+      if ((newSl == null || newTp == null) && (await this.requiresBracket(client, accountId))) {
+        await client.query("ROLLBACK");
+        return { ok: false, error: "You must keep both a stop loss and a take profit while in a position — you can move them, but not remove them." };
+      }
+
       if (newSl == null && newTp == null) {
         await client.query(
           `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'bracket removed', "updatedAt" = now()
@@ -556,6 +589,24 @@ export class OrderEngine {
   }
 
   // --- helpers -----------------------------------------------------
+
+  /** Does this account's rule require a protective bracket (SL + TP) on positions? */
+  private async requiresBracket(client: PoolClient, accountId: string): Promise<boolean> {
+    const { rows } = await client.query<{ stopLossRequired: boolean }>(
+      `SELECT r."stopLossRequired" FROM "Rule" r WHERE r."accountId" = $1`,
+      [accountId],
+    );
+    return Boolean(rows[0]?.stopLossRequired);
+  }
+
+  /** Is there an open position for this symbol? */
+  private async hasOpenPosition(client: PoolClient, accountId: string, symbol: string): Promise<boolean> {
+    const { rows } = await client.query<{ one: number }>(
+      `SELECT 1 AS one FROM "Position" WHERE "accountId" = $1 AND "symbol" = $2 LIMIT 1`,
+      [accountId, symbol],
+    );
+    return rows.length > 0;
+  }
 
   private async getPosition(client: PoolClient, accountId: string, symbol: string): Promise<PositionRow | null> {
     const { rows } = await client.query<PositionRow>(
