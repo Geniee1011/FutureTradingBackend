@@ -38,6 +38,7 @@ import {
   adminListRuleTemplates,
   adminListTraders,
   adminListViolations,
+  adminAssignTier,
   adminResetAccount,
   adminSetAccountStatus,
   adminSetTraderStatus,
@@ -222,7 +223,7 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
     return handleAdminResetPassword(url, req, res, opts.auth);
   if (/^\/api\/admin\/accounts\/[^/]+\/status$/.test(url.pathname) && req.method === "POST")
     return handleAdminStatus(url, req, res, opts.accountStream, "account");
-  if (/^\/api\/admin\/accounts\/[^/]+\/(reset|adjust-balance|close-all|liquidate|cancel-orders)$/.test(url.pathname) && req.method === "POST")
+  if (/^\/api\/admin\/accounts\/[^/]+\/(reset|adjust-balance|close-all|liquidate|cancel-orders|assign-tier)$/.test(url.pathname) && req.method === "POST")
     return handleAdminAccountAction(url, req, res, opts.orderEngine, opts.accountStream);
   if (/^\/api\/admin\/rules\/[^/]+$/.test(url.pathname) && req.method === "POST")
     return handleAdminRuleUpdate(url, req, res);
@@ -387,6 +388,15 @@ async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: Ser
         result = { ok: true, closed };
         break;
       }
+      case "assign-tier": {
+        const body = await readJson<{ templateId?: string }>(req);
+        const templateId = body?.templateId?.trim();
+        if (!templateId) return json(res, 400, { error: "templateId is required" });
+        const ok = await adminAssignTier(accountId, templateId);
+        if (!ok) return json(res, 404, { ok: false, error: "account or tier not found" });
+        result = { ok: true, templateId };
+        break;
+      }
       default:
         return json(res, 400, { error: "unknown action" });
     }
@@ -394,7 +404,7 @@ async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: Ser
     // A reset zeroes equity back to the starting balance — clear the trailing drawdown
     // peak too (after the snapshot reload) so live drawdown recomputes to $0, not the
     // pre-reset high-water mark.
-    if (action === "reset") accountStream.resetDrawdownPeak(accountId);
+    if (action === "reset" || action === "assign-tier") accountStream.resetDrawdownPeak(accountId);
     accountStream.publishAdminUpdate({ kind: `account_${action}`, id: accountId });
     json(res, 200, result);
   } catch (err) {

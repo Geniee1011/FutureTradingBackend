@@ -23,6 +23,8 @@ export interface AdminTrader {
   riskScore: number;
   lastActive: number;
   createdAt: number;
+  accountSize: number | null; // assigned rule-tier size ($50K…$1M), null if unassigned
+  accountPhase: string | null; // 'Challenge Phase 1' | 'Challenge Phase 2' | 'Funded'
 }
 
 export interface AdminAccountRow {
@@ -63,6 +65,7 @@ export interface AdminRuleRow {
 
 // --- derivations for fields the schema doesn't store ---
 const ms = (t: Date | string | null) => (t ? new Date(t).getTime() : 0);
+const formatSize = (n: number) => (n >= 1_000_000 ? `$${n / 1_000_000}M` : n >= 1_000 ? `$${n / 1_000}K` : `$${n}`);
 const tierFor = (equity: number) => (equity >= 100_000 ? "platinum" : equity >= 75_000 ? "gold" : equity >= 55_000 ? "silver" : "bronze");
 function traderStatus(userStatus: string, accountStatus: string | null): TraderStatus {
   if (userStatus === "SUSPENDED") return "suspended";
@@ -97,12 +100,13 @@ export async function adminListTraders(): Promise<AdminTrader[]> {
   const { rows } = await getPool().query(
     `SELECT u."id", u."name", u."email", u."status" AS "userStatus", u."createdAt",
             a."id" AS "accountId", a."equity", a."totalPnl", a."drawdown", a."status" AS "accountStatus",
-            r."maxDrawdown",
+            r."maxDrawdown", rt."accountSize", rt."phase" AS "accountPhase",
             (SELECT count(*)::int FROM "Position" p WHERE p."accountId" = a."id") AS "openPositions",
             (SELECT max(al."createdAt") FROM "ActivityLog" al WHERE al."accountId" = a."id") AS "lastActive"
      FROM "User" u
      LEFT JOIN "Account" a ON a."userId" = u."id"
      LEFT JOIN "Rule" r ON r."accountId" = a."id"
+     LEFT JOIN "RuleTemplate" rt ON rt."id" = a."ruleTemplateId"
      WHERE u."role" = 'TRADER'
      ORDER BY u."createdAt" DESC`,
   );
@@ -124,6 +128,8 @@ export async function adminListTraders(): Promise<AdminTrader[]> {
       riskScore: maxDd > 0 ? Math.max(0, Math.min(100, Math.round((drawdown / maxDd) * 100))) : 0,
       lastActive: ms(r.lastActive) || ms(r.createdAt),
       createdAt: ms(r.createdAt),
+      accountSize: r.accountSize != null ? Number(r.accountSize) : null,
+      accountPhase: (r.accountPhase as string | null) ?? null,
     };
   });
 }
@@ -371,6 +377,7 @@ export interface AdminTraderAccount {
   highestEquity: number;
   status: string;
   currency: string;
+  ruleTemplateId: string | null;
   createdAt: number;
 }
 export interface AdminTraderRule {
@@ -424,7 +431,7 @@ export async function adminGetTraderDetail(userId: string): Promise<AdminTraderD
     `SELECT u."id", u."name", u."email", u."status" AS "userStatus", u."createdAt",
             a."id" AS "accountId", a."startingBalance", a."balance", a."equity", a."dailyPnl",
             a."totalPnl", a."drawdown", a."highestEquity", a."status" AS "accountStatus",
-            a."createdAt" AS "accountCreatedAt",
+            a."ruleTemplateId", a."createdAt" AS "accountCreatedAt",
             r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."maxContracts"
      FROM "User" u
      LEFT JOIN "Account" a ON a."userId" = u."id"
@@ -454,6 +461,8 @@ export async function adminGetTraderDetail(userId: string): Promise<AdminTraderD
     riskScore: maxDd > 0 ? Math.max(0, Math.min(100, Math.round((drawdown / maxDd) * 100))) : 0,
     lastActive: ms(b.createdAt),
     createdAt: ms(b.createdAt),
+    accountSize: null, // detail view derives the tier from account.ruleTemplateId + templates
+    accountPhase: null,
   };
   const account: AdminTraderAccount | null = accountId
     ? {
@@ -467,6 +476,7 @@ export async function adminGetTraderDetail(userId: string): Promise<AdminTraderD
         highestEquity: Number(b.highestEquity),
         status: b.accountStatus,
         currency: "USD",
+        ruleTemplateId: (b.ruleTemplateId as string | null) ?? null,
         createdAt: ms(b.accountCreatedAt),
       }
     : null;
@@ -779,6 +789,103 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
               "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
       [accountId],
     );
+    await client.query("COMMIT");
+    return true;
+  } catch (err) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
+  }
+}
+
+/**
+ * Assign an account size / tier to a trader's account: links it to the rule template,
+ * copies the template's full ruleset onto the per-account Rule row, and resets the
+ * account to that tier's starting state (size, balance, drawdown anchors, challenge
+ * phase). Live state (positions, resting orders) is cleared like a reset; history is kept.
+ * Returns false if the account or template doesn't exist.
+ */
+export async function adminAssignTier(accountId: string, templateId: string): Promise<boolean> {
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
+
+    const tpl = await client.query(
+      `SELECT "phase","accountSize","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+              "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+              "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+              "drawdownType","allowedInstruments"
+       FROM "RuleTemplate" WHERE "id" = $1`,
+      [templateId],
+    );
+    const t = tpl.rows[0];
+    if (!t) { await client.query("ROLLBACK"); return false; }
+
+    const lock = await client.query(`SELECT "id" FROM "Account" WHERE "id" = $1 FOR UPDATE`, [accountId]);
+    if (!lock.rows[0]) { await client.query("ROLLBACK"); return false; }
+
+    const size = Number(t.accountSize);
+    // Challenge Phase 1 starts at phase 1; Phase 2 and Funded sit at phase 2 so hitting
+    // the profit target marks PASSED (manual review) rather than auto-advancing.
+    const challengePhase = t.phase === "Challenge Phase 1" ? 1 : 2;
+
+    // Clear LIVE state (mirrors a reset); keep history.
+    await client.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
+    await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1`, [accountId]);
+    await client.query(
+      `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'Tier reassigned', "updatedAt" = now()
+       WHERE "accountId" = $1 AND "status" = 'PENDING'`,
+      [accountId],
+    );
+    await client.query(
+      `INSERT INTO "Transaction" ("accountId","type","amount","description") VALUES ($1,'DEPOSIT',$2,'Tier assigned — opening balance')`,
+      [accountId, size],
+    );
+
+    // Reset the account to the tier's starting state.
+    await client.query(
+      `UPDATE "Account" SET
+         "ruleTemplateId" = $2, "startingBalance" = $3,
+         "balance" = $3, "equity" = $3, "dailyPnl" = 0, "totalPnl" = 0,
+         "drawdown" = 0, "highestEquity" = $3,
+         "dayStartEquity" = $3, "dayStartAt" = CURRENT_DATE,
+         "peakIntradayEquity" = $3, "eodPeakEquity" = $3,
+         "tradingPausedAt" = NULL, "challengePhase" = $4,
+         "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now()
+       WHERE "id" = $1`,
+      [accountId, templateId, size, challengePhase],
+    );
+
+    // Copy the template's full ruleset onto the per-account Rule row (insert if missing).
+    await client.query(
+      `INSERT INTO "Rule" (
+         "accountId","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+         "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+         "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+         "drawdownType","allowedInstruments","updatedAt"
+       ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15, now())
+       ON CONFLICT ("accountId") DO UPDATE SET
+         "maxDailyLoss" = EXCLUDED."maxDailyLoss", "maxDrawdown" = EXCLUDED."maxDrawdown",
+         "profitTarget" = EXCLUDED."profitTarget", "maxContracts" = EXCLUDED."maxContracts",
+         "minTradingDays" = EXCLUDED."minTradingDays", "maxDailyProfitPct" = EXCLUDED."maxDailyProfitPct",
+         "maxRiskPerTrade" = EXCLUDED."maxRiskPerTrade", "maxPositionUnits" = EXCLUDED."maxPositionUnits",
+         "stopLossRequired" = EXCLUDED."stopLossRequired", "minHoldTimeSecs" = EXCLUDED."minHoldTimeSecs",
+         "overnightHoldsProhibited" = EXCLUDED."overnightHoldsProhibited",
+         "weekendHoldsProhibited" = EXCLUDED."weekendHoldsProhibited",
+         "drawdownType" = EXCLUDED."drawdownType", "allowedInstruments" = EXCLUDED."allowedInstruments",
+         "updatedAt" = now()`,
+      [accountId, Number(t.maxDailyLoss), Number(t.maxDrawdown), Number(t.profitTarget), Number(t.maxContracts),
+       Number(t.minTradingDays), Number(t.maxDailyProfitPct), Number(t.maxRiskPerTrade), Number(t.maxPositionUnits),
+       Boolean(t.stopLossRequired), Number(t.minHoldTimeSecs), Boolean(t.overnightHoldsProhibited),
+       Boolean(t.weekendHoldsProhibited), t.drawdownType, (t.allowedInstruments as string[] | null) ?? []],
+    );
+
+    await client.query(
+      `INSERT INTO "ActivityLog" ("accountId","type","message") VALUES ($1,'ACCOUNT_PASSED',$2)`,
+      [accountId, `Account tier assigned: ${t.phase} — ${formatSize(size)}`],
+    );
+
     await client.query("COMMIT");
     return true;
   } catch (err) {

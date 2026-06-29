@@ -90,7 +90,10 @@ export interface ApiAccount {
   totalPnl: number;
   drawdown: number;
   highestEquity: number;
-  rule: { profitTarget: number; maxDailyLoss: number; maxDrawdown: number; maxContracts: number };
+  rule: {
+    profitTarget: number; maxDailyLoss: number; maxDrawdown: number; maxContracts: number;
+    maxRiskPerTrade: number; maxPositionUnits: number; stopLossRequired: boolean; minHoldTimeSecs: number;
+  };
 }
 
 /** Full account + evaluation rule for the account page. */
@@ -98,7 +101,8 @@ export async function getAccountDetail(accountId: string): Promise<ApiAccount | 
   const { rows } = await getPool().query(
     `SELECT a."id", a."status", a."startingBalance", a."balance", a."equity",
             a."totalPnl", a."dailyPnl", a."drawdown", a."highestEquity", a."dayStartEquity",
-            r."profitTarget", r."maxDailyLoss", r."maxDrawdown", r."maxContracts"
+            r."profitTarget", r."maxDailyLoss", r."maxDrawdown", r."maxContracts",
+            r."maxRiskPerTrade", r."maxPositionUnits", r."stopLossRequired", r."minHoldTimeSecs"
      FROM "Account" a
      LEFT JOIN "Rule" r ON r."accountId" = a."id"
      WHERE a."id" = $1`,
@@ -125,6 +129,10 @@ export async function getAccountDetail(accountId: string): Promise<ApiAccount | 
       maxDailyLoss: Number(r.maxDailyLoss ?? 0),
       maxDrawdown: Number(r.maxDrawdown ?? 0),
       maxContracts: Number(r.maxContracts ?? 0),
+      maxRiskPerTrade: Number(r.maxRiskPerTrade ?? 0),
+      maxPositionUnits: Number(r.maxPositionUnits ?? 0),
+      stopLossRequired: Boolean(r.stopLossRequired ?? false),
+      minHoldTimeSecs: Number(r.minHoldTimeSecs ?? 0),
     },
   };
 }
