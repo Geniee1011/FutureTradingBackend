@@ -24,6 +24,7 @@ type ViolationType = "DAILY_LOSS_EXCEEDED" | "MAX_DRAWDOWN_BREACHED";
 interface EvalRow {
   status: string;
   challengePhase: number;
+  ruleTemplateId: string | null;
   startingBalance: string;
   highestEquity: string;
   dayStartEquity: string | null;
@@ -40,6 +41,20 @@ interface EvalRow {
 
 const round2 = (v: number) => Math.round(v * 100) / 100;
 const dateStr = (d: Date | string) => new Date(d).toISOString().slice(0, 10);
+
+// Account progression ladder: passing one tier's profit target auto-advances to the next.
+// The 50k and 100k challenge paths merge into one shared funded scaling ladder. `f_1m` is the
+// top — it has no successor, so it stays put (a target hit there is a payout reset, not a scale).
+const NEXT_TIER: Record<string, string> = {
+  c1_50k: "c2_50k",
+  c2_50k: "f_50k",
+  c1_100k: "c2_100k",
+  c2_100k: "f_100k",
+  f_50k: "f_100k",
+  f_100k: "f_250k",
+  f_250k: "f_500k",
+  f_500k: "f_1m",
+};
 
 export class RiskEngine {
   private processing = new Set<string>(); // accounts mid terminal-transition
@@ -61,7 +76,7 @@ export class RiskEngine {
     this.last.set(accountId, { equity, day: today });
 
     const { rows } = await getPool().query<EvalRow>(
-      `SELECT a."status", a."challengePhase", a."startingBalance", a."highestEquity",
+      `SELECT a."status", a."challengePhase", a."ruleTemplateId", a."startingBalance", a."highestEquity",
               a."dayStartEquity", a."dayStartAt", a."tradingPausedAt",
               a."peakIntradayEquity", a."eodPeakEquity",
               r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."minTradingDays", r."drawdownType"
@@ -136,8 +151,8 @@ export class RiskEngine {
       await this.terminate(accountId, "FAILED", "MAX_DRAWDOWN_BREACHED",
         `${label}: equity $${round2(equity)} fell to/below floor $${floor} (limit $${maxDrawdown})`);
     } else if (profitTarget > 0 && profit >= profitTarget) {
-      // Profit target hit — check additional conditions before passing.
-      await this.checkAndPass(accountId, profit, profitTarget, minTradingDays, Number(a.challengePhase));
+      // Profit target hit — check additional conditions before passing/advancing.
+      await this.checkAndPass(accountId, profit, profitTarget, minTradingDays, a.ruleTemplateId);
     }
   }
 
@@ -172,16 +187,17 @@ export class RiskEngine {
   }
 
   /**
-   * Profit target reached — verify minimum trading days before passing.
-   * Phase 1: if conditions met → auto-advance to Phase 2 (reset stats, apply Phase 2 rule).
-   * Phase 2: mark PASSED for manual admin review → funded upgrade.
+   * Profit target reached — verify minimum trading days, then advance up the tier ladder
+   * (NEXT_TIER): c1→c2→funded, then funded scaling 50k→100k→250k→500k→1m, each step
+   * triggered by hitting that tier's target. The top tier (f_1m) resets in place (a
+   * payout) rather than stopping; an account on no/unknown tier falls back to PASSED.
    */
   private async checkAndPass(
     accountId: string,
     profit: number,
     target: number,
     minTradingDays: number,
-    challengePhase: number,
+    currentTier: string | null,
   ): Promise<void> {
     // Count distinct calendar days with at least one filled order in this challenge.
     if (minTradingDays > 0) {
@@ -200,90 +216,97 @@ export class RiskEngine {
     }
 
     const detail = `Profit $${profit} reached target $${target}`;
-    if (challengePhase === 1) {
-      await this.advanceToPhase2(accountId, detail);
+    const next = currentTier ? NEXT_TIER[currentTier] : undefined;
+    if (next) {
+      // Climb to the next tier (challenge phase or a bigger funded account).
+      await this.advanceToTier(accountId, next, `${detail} — advanced to ${next}`);
+    } else if (currentTier === "f_1m") {
+      // Top of the ladder — a target hit is a payout: reset the $1M account in place
+      // so the trader keeps going rather than being stopped.
+      await this.advanceToTier(accountId, "f_1m", `${detail} — payout, $1M account reset`);
     } else {
+      // No recognized tier (custom/ad-hoc account) — preserve the old PASSED-for-review path.
       await this.terminate(accountId, "PASSED", null, detail);
     }
   }
 
   /**
-   * Phase 1 passed — reset account stats and apply the Phase 2 rule template
-   * so the trader starts Phase 2 from a clean slate on the same account.
+   * Advance an account onto `templateId` (the next rung of NEXT_TIER): reset its stats and
+   * size to that tier's starting state and apply its full ruleset, on the SAME account.
+   * Used for every step — Phase 1→2, Phase 2→funded, and funded scaling — so size changes
+   * (e.g. 50k→100k) flow through here too. A clean slate: positions/orders are cleared.
    */
-  private async advanceToPhase2(accountId: string, detail: string): Promise<void> {
+  private async advanceToTier(accountId: string, templateId: string, detail: string): Promise<void> {
     if (this.processing.has(accountId)) return;
     this.processing.add(accountId);
     try {
       const client = await getPool().connect();
       try {
         await client.query("BEGIN");
-        const lock = await client.query<{ status: string; startingBalance: string; ruleTemplateId: string | null }>(
-          `SELECT "status","startingBalance","ruleTemplateId" FROM "Account" WHERE "id" = $1 FOR UPDATE`,
+        const lock = await client.query<{ status: string }>(
+          `SELECT "status" FROM "Account" WHERE "id" = $1 FOR UPDATE`,
           [accountId],
         );
-        const acc = lock.rows[0];
-        if (!acc || acc.status !== "ACTIVE") { await client.query("ROLLBACK"); return; }
+        if (lock.rows[0]?.status !== "ACTIVE") { await client.query("ROLLBACK"); return; }
 
-        const startBal = Number(acc.startingBalance);
+        // The destination tier defines the new account size and challenge phase.
+        const tpl = (await client.query<{ phase: string; accountSize: string }>(
+          `SELECT "phase","accountSize" FROM "RuleTemplate" WHERE "id" = $1`,
+          [templateId],
+        )).rows[0];
+        if (!tpl) { await client.query("ROLLBACK"); return; }
+        const size = Number(tpl.accountSize);
+        const phase = tpl.phase === "Challenge Phase 1" ? 1 : 2;
 
-        // Pick the Phase 2 template that matches this account's size.
-        const templateId = acc.ruleTemplateId;
-        let phase2TemplateId: string | null = null;
-        if (templateId?.startsWith("c1_")) {
-          phase2TemplateId = templateId.replace("c1_", "c2_");
-        }
-
-        // Reset the account to starting balance + update challenge phase.
+        // Reset the account to the destination tier's starting state (size + anchors + phase).
         await client.query(
           `UPDATE "Account"
-           SET "balance" = $2, "equity" = $2, "dailyPnl" = 0, "totalPnl" = 0,
+           SET "ruleTemplateId" = $3, "startingBalance" = $2,
+               "balance" = $2, "equity" = $2, "dailyPnl" = 0, "totalPnl" = 0,
                "drawdown" = 0, "highestEquity" = $2,
                "dayStartEquity" = $2, "dayStartAt" = CURRENT_DATE,
                "peakIntradayEquity" = $2, "eodPeakEquity" = $2,
-               "tradingPausedAt" = NULL, "challengePhase" = 2,
-               "challengeStartedAt" = now(), "ruleTemplateId" = COALESCE($3, "ruleTemplateId"),
-               "updatedAt" = now()
+               "tradingPausedAt" = NULL, "challengePhase" = $4,
+               "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now()
            WHERE "id" = $1`,
-          [accountId, startBal, phase2TemplateId],
+          [accountId, size, templateId, phase],
         );
 
-        // Apply the Phase 2 rule template (if we can find it).
-        if (phase2TemplateId) {
-          await client.query(
-            `UPDATE "Rule" SET
-               "maxDailyLoss"            = t."maxDailyLoss",
-               "maxDrawdown"             = t."maxDrawdown",
-               "profitTarget"            = t."profitTarget",
-               "maxContracts"            = t."maxContracts",
-               "minTradingDays"          = t."minTradingDays",
-               "maxDailyProfitPct"       = t."maxDailyProfitPct",
-               "maxRiskPerTrade"         = t."maxRiskPerTrade",
-               "maxPositionUnits"        = t."maxPositionUnits",
-               "stopLossRequired"        = t."stopLossRequired",
-               "minHoldTimeSecs"         = t."minHoldTimeSecs",
-               "overnightHoldsProhibited"= t."overnightHoldsProhibited",
-               "weekendHoldsProhibited"  = t."weekendHoldsProhibited",
-               "allowedInstruments"      = t."allowedInstruments",
-               "updatedAt"               = now()
-             FROM "RuleTemplate" t
-             WHERE "Rule"."accountId" = $1 AND t."id" = $2`,
-            [accountId, phase2TemplateId],
-          );
-        }
+        // Copy the destination tier's full ruleset onto the per-account Rule row.
+        await client.query(
+          `UPDATE "Rule" SET
+             "maxDailyLoss"            = t."maxDailyLoss",
+             "maxDrawdown"             = t."maxDrawdown",
+             "profitTarget"            = t."profitTarget",
+             "maxContracts"            = t."maxContracts",
+             "minTradingDays"          = t."minTradingDays",
+             "maxDailyProfitPct"       = t."maxDailyProfitPct",
+             "maxRiskPerTrade"         = t."maxRiskPerTrade",
+             "maxPositionUnits"        = t."maxPositionUnits",
+             "stopLossRequired"        = t."stopLossRequired",
+             "minHoldTimeSecs"         = t."minHoldTimeSecs",
+             "overnightHoldsProhibited"= t."overnightHoldsProhibited",
+             "weekendHoldsProhibited"  = t."weekendHoldsProhibited",
+             "drawdownType"            = t."drawdownType",
+             "allowedInstruments"      = t."allowedInstruments",
+             "updatedAt"               = now()
+           FROM "RuleTemplate" t
+           WHERE "Rule"."accountId" = $1 AND t."id" = $2`,
+          [accountId, templateId],
+        );
 
-        // Clear Phase 1 positions/orders so Phase 2 starts clean.
+        // Clear live state so the new tier starts clean.
         await client.query(`DELETE FROM "Position" WHERE "accountId" = $1`, [accountId]);
         await client.query(`DELETE FROM "PositionLot" WHERE "accountId" = $1`, [accountId]);
         await client.query(
-          `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'Phase 1 completed', "updatedAt" = now()
+          `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'Tier advanced', "updatedAt" = now()
            WHERE "accountId" = $1 AND "status" = 'PENDING'`,
           [accountId],
         );
 
         await client.query(
           `INSERT INTO "ActivityLog" ("accountId","type","message") VALUES ($1,'ACCOUNT_PASSED',$2)`,
-          [accountId, `${detail} — advanced to Challenge Phase 2`],
+          [accountId, detail],
         );
         await client.query("COMMIT");
       } catch (e) {
@@ -293,11 +316,11 @@ export class RiskEngine {
         client.release();
       }
 
-      console.log(`[risk] account ${accountId} advanced to Phase 2 — ${detail}`);
+      console.log(`[risk] account ${accountId} advanced to ${templateId} — ${detail}`);
       await this.accountStream.refreshAccount(accountId);
       this.accountStream.publishAdminUpdate({ kind: "PHASE_ADVANCED", accountId, detail });
     } catch (err) {
-      console.error("[risk] phase advance failed:", (err as Error).message);
+      console.error("[risk] tier advance failed:", (err as Error).message);
     } finally {
       this.processing.delete(accountId);
     }

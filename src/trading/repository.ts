@@ -4,6 +4,10 @@ import { SYMBOLS } from "../instruments.js";
 /** Default evaluation parameters for a newly registered trader. */
 const STARTING_BALANCE = 50_000;
 const DEFAULT_RULE = { maxDailyLoss: 2_500, maxDrawdown: 3_000, profitTarget: 6_000, maxContracts: 5 };
+// Starting tier for a self-registered trader: the $50,000 Challenge Phase 1. Linking the
+// account to this template (not just an ad-hoc rule) is what makes it show up as a proper
+// "$50,000" tier in the admin "Account size / type" control instead of "Select a tier…".
+const DEFAULT_TIER_ID = "c1_50k";
 
 export interface ViolationRecord {
   id: string;
@@ -38,24 +42,60 @@ export async function createEvaluationAccount(userId: string): Promise<void> {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
+
+    // Pull the starting tier so the account is linked to a real template (size +
+    // full ruleset). Falls back to the ad-hoc DEFAULT_RULE if the template is absent.
+    const tpl = (
+      await client.query(
+        `SELECT "phase","accountSize","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+                "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+                "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+                "drawdownType","allowedInstruments"
+         FROM "RuleTemplate" WHERE "id" = $1`,
+        [DEFAULT_TIER_ID],
+      )
+    ).rows[0];
+
+    const size = tpl ? Number(tpl.accountSize) : STARTING_BALANCE;
+    const phase = tpl && tpl.phase !== "Challenge Phase 1" ? 2 : 1;
+
     const acc = await client.query<{ id: string }>(
-      `INSERT INTO "Account" ("userId","startingBalance","balance","equity","highestEquity","dayStartEquity","dayStartAt","status")
-       VALUES ($1,$2,$2,$2,$2,$2,CURRENT_DATE,'ACTIVE')
+      `INSERT INTO "Account" (
+         "userId","ruleTemplateId","startingBalance","balance","equity","highestEquity",
+         "dayStartEquity","dayStartAt","peakIntradayEquity","eodPeakEquity","challengePhase",
+         "challengeStartedAt","status")
+       VALUES ($1,$2,$3,$3,$3,$3,$3,CURRENT_DATE,$3,$3,$4,now(),'ACTIVE')
        ON CONFLICT ("userId") DO NOTHING
        RETURNING "id"`,
-      [userId, STARTING_BALANCE],
+      [userId, tpl ? DEFAULT_TIER_ID : null, size, phase],
     );
     const accountId = acc.rows[0]?.id;
     if (accountId) {
-      await client.query(
-        `INSERT INTO "Rule" ("accountId","maxDailyLoss","maxDrawdown","profitTarget","maxContracts","allowedInstruments")
-         VALUES ($1,$2,$3,$4,$5,$6)`,
-        [accountId, DEFAULT_RULE.maxDailyLoss, DEFAULT_RULE.maxDrawdown, DEFAULT_RULE.profitTarget, DEFAULT_RULE.maxContracts, SYMBOLS],
-      );
+      if (tpl) {
+        // Copy the template's full ruleset onto the account (mirrors adminAssignTier).
+        await client.query(
+          `INSERT INTO "Rule" (
+             "accountId","maxDailyLoss","maxDrawdown","profitTarget","maxContracts",
+             "minTradingDays","maxDailyProfitPct","maxRiskPerTrade","maxPositionUnits",
+             "stopLossRequired","minHoldTimeSecs","overnightHoldsProhibited","weekendHoldsProhibited",
+             "drawdownType","allowedInstruments")
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)`,
+          [accountId, Number(tpl.maxDailyLoss), Number(tpl.maxDrawdown), Number(tpl.profitTarget), Number(tpl.maxContracts),
+           Number(tpl.minTradingDays), Number(tpl.maxDailyProfitPct), Number(tpl.maxRiskPerTrade), Number(tpl.maxPositionUnits),
+           Boolean(tpl.stopLossRequired), Number(tpl.minHoldTimeSecs), Boolean(tpl.overnightHoldsProhibited),
+           Boolean(tpl.weekendHoldsProhibited), tpl.drawdownType, (tpl.allowedInstruments as string[] | null) ?? SYMBOLS],
+        );
+      } else {
+        await client.query(
+          `INSERT INTO "Rule" ("accountId","maxDailyLoss","maxDrawdown","profitTarget","maxContracts","allowedInstruments")
+           VALUES ($1,$2,$3,$4,$5,$6)`,
+          [accountId, DEFAULT_RULE.maxDailyLoss, DEFAULT_RULE.maxDrawdown, DEFAULT_RULE.profitTarget, DEFAULT_RULE.maxContracts, SYMBOLS],
+        );
+      }
       await client.query(
         `INSERT INTO "Transaction" ("accountId","type","amount","description")
          VALUES ($1,'DEPOSIT',$2,'Initial deposit')`,
-        [accountId, STARTING_BALANCE],
+        [accountId, size],
       );
     }
     await client.query("COMMIT");
