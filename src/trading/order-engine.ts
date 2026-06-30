@@ -478,21 +478,32 @@ export class OrderEngine {
       if (changes.stopLoss !== undefined) newSl = changes.stopLoss == null ? null : Number(changes.stopLoss);
       if (changes.takeProfit !== undefined) newTp = changes.takeProfit == null ? null : Number(changes.takeProfit);
 
-      // Re-enforce max risk per trade when (re)setting the bracket on a PENDING ENTRY order.
-      // Moving the SL or the entry price must keep the implied risk within the cap — the
-      // order hasn't filled, so the entry-time check still applies. (Exit legs of an OPEN
-      // position are intentionally exempt: a trader may widen the stop on a live trade.)
-      if (!isExitLeg && newPrice != null && newSl != null) {
-        const { rows: rr } = await client.query<{ maxRiskPerTrade: string | null }>(
-          `SELECT r."maxRiskPerTrade" FROM "Rule" r WHERE r."accountId" = $1`,
-          [accountId],
-        );
-        const maxRiskPerTrade = rr[0]?.maxRiskPerTrade != null ? Number(rr[0].maxRiskPerTrade) : 0;
-        if (maxRiskPerTrade > 0) {
-          const impliedRisk = Math.abs(newPrice - newSl) * Number(row.quantity) * getMultiplier(row.symbol);
-          if (impliedRisk > maxRiskPerTrade) {
+      // Enforce max risk per trade on ANY stop move — both a PENDING ENTRY order (entry vs
+      // its SL) AND the exit-leg STOP of a LIVE position (avg entry vs the stop). The latter
+      // was previously exempt, which let a trader pass the entry risk check with a tight stop
+      // and then drag the stop out past the cap — a prop-firm loophole. Now both are capped.
+      if (newPrice != null) {
+        let ref: number | null = null;
+        let stopPx: number | null = null;
+        if (!isExitLeg && newSl != null) {
+          ref = newPrice; // pending entry: risk = |entry − SL|
+          stopPx = newSl;
+        } else if (isExitLeg && row.type === "STOP") {
+          // Live exit stop: risk = |position avg − stop level|.
+          const posRes = await client.query<{ averagePrice: string }>(
+            `SELECT "averagePrice" FROM "Position" WHERE "accountId" = $1 AND "symbol" = $2`,
+            [accountId, row.symbol],
+          );
+          if (posRes.rows[0]) {
+            ref = Number(posRes.rows[0].averagePrice);
+            stopPx = newPrice;
+          }
+        }
+        if (ref != null && stopPx != null) {
+          const riskErr = await this.stopRiskError(client, accountId, row.symbol, ref, stopPx, Number(row.quantity));
+          if (riskErr) {
             await client.query("ROLLBACK");
-            return { ok: false, error: `This stop risks $${Math.round(impliedRisk)} — your limit is $${maxRiskPerTrade}.` };
+            return { ok: false, error: riskErr };
           }
         }
       }
@@ -596,6 +607,15 @@ export class OrderEngine {
         await client.query("ROLLBACK");
         return { ok: false, error: bErr };
       }
+      // Cap the stop's risk against max-risk-per-trade (avg entry vs the stop level), so a
+      // position bracket can't be set/widened beyond the per-trade limit.
+      if (newSl != null) {
+        const riskErr = await this.stopRiskError(client, accountId, symbol, avg, newSl, qty);
+        if (riskErr) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: riskErr };
+        }
+      }
       await this.createBracketChildren(client, accountId, symbol, entrySide, qty, newSl, newTp);
       await client.query("COMMIT");
       this.accountStream.publishOrderUpdate(accountId, { symbol, status: "open" });
@@ -609,6 +629,29 @@ export class OrderEngine {
   }
 
   // --- helpers -----------------------------------------------------
+
+  /**
+   * Max-risk-per-trade guard for a stop. Given the reference price (entry for a pending
+   * order, or the position's average price for a live trade) and the stop level, returns
+   * an error string if the implied loss exceeds the account's cap — or null if within it.
+   */
+  private async stopRiskError(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    ref: number,
+    stopPrice: number,
+    qty: number,
+  ): Promise<string | null> {
+    const { rows } = await client.query<{ maxRiskPerTrade: string | null }>(
+      `SELECT r."maxRiskPerTrade" FROM "Rule" r WHERE r."accountId" = $1`,
+      [accountId],
+    );
+    const cap = rows[0]?.maxRiskPerTrade != null ? Number(rows[0].maxRiskPerTrade) : 0;
+    if (cap <= 0) return null;
+    const risk = Math.abs(ref - stopPrice) * qty * getMultiplier(symbol);
+    return risk > cap ? `This stop risks $${Math.round(risk)} — your limit is $${cap}.` : null;
+  }
 
   /** Does this account's rule require a protective bracket (SL + TP) on positions? */
   private async requiresBracket(client: PoolClient, accountId: string): Promise<boolean> {
