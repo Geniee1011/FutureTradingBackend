@@ -94,6 +94,10 @@ export class DatabentoLiveProvider extends BaseProvider {
   private failing = false;
   private lastErrorLogAt = 0;
   private lastSocketError: string | null = null;
+  // Intraday-replay self-disable: set true if the gateway ever rejects a subscription,
+  // so the next (re)connect subscribes from "now" (the always-works path) instead of
+  // looping on the same rejection. Reset on a clean stop().
+  private replayDisabled = false;
 
   constructor(
     private readonly apiKey: string,
@@ -127,6 +131,7 @@ export class DatabentoLiveProvider extends BaseProvider {
 
   stop(): void {
     this.running = false;
+    this.replayDisabled = false; // a fresh start may re-attempt intraday replay
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.dailyTimer) clearTimeout(this.dailyTimer);
     if (this.watchdogTimer) clearInterval(this.watchdogTimer);
@@ -322,8 +327,19 @@ export class DatabentoLiveProvider extends BaseProvider {
       this.socket?.write(`auth=${response}|dataset=${this.dataset}|encoding=dbn|ts_out=0\n`);
     } else if (line.startsWith("success=")) {
       const symbols = INSTRUMENTS.map((i) => i.databentoSymbol).join(",");
-      // No `start` field → live subscription from now (empty start is rejected).
-      this.socket?.write(`schema=trades|stype_in=continuous|symbols=${symbols}\n`);
+      // Intraday REPLAY on (re)connect: instead of streaming only from "now", ask the
+      // gateway to replay recent trades from `start` so the window we just missed (e.g.
+      // a backend restart) is backfilled with REAL trade prints — no waiting on the
+      // Historical API's multi-minute publication lag, which is what leaves a visible
+      // gap after a restart. Bounded lookback; `start` is UNIX nanoseconds (built as a
+      // string to avoid float precision loss). A bare/empty start is rejected by the
+      // gateway, so we only ever send a concrete timestamp, and `replayDisabled` falls
+      // back to from-now if the gateway rejects the subscription.
+      const replayMin = Number(process.env.DATABENTO_LIVE_REPLAY_MIN ?? "15");
+      const useReplay = !this.replayDisabled && replayMin > 0;
+      const startField = useReplay ? `|start=${Date.now() - replayMin * 60_000}000000` : "";
+      this.socket?.write(`schema=trades|stype_in=continuous|symbols=${symbols}${startField}\n`);
+      if (useReplay) console.log(`[live] requesting ${replayMin}m intraday replay to backfill the reconnect gap`);
       // Top-of-book (best bid/ask) for ACCURATE quotes. Without it we fabricate a
       // symmetric ±1-tick spread (last always dead-centre), which is wrong vs the
       // real market. Set DATABENTO_BBO=0 to disable if it ever troubles the gateway.
@@ -345,6 +361,13 @@ export class DatabentoLiveProvider extends BaseProvider {
       // Unconditional — a subscription/entitlement rejection must never be
       // swallowed by the error throttle.
       console.warn(`[live] gateway error: ${line.trim()}`);
+      // A rejected subscription is most likely the intraday-replay `start` (entitlement
+      // or format). Disable replay so the reconnect subscribes from "now" — the path
+      // that has always worked — rather than looping on the same rejection.
+      if (!this.replayDisabled) {
+        this.replayDisabled = true;
+        console.warn("[live] disabling intraday replay after gateway error — will resubscribe from now");
+      }
       this.socket?.destroy();
     } else if (line.trim()) {
       // Any other control line (warnings, rejects) — surface it raw to diagnose
