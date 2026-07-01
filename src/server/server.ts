@@ -653,7 +653,7 @@ async function handleModifyOrder(url: URL, req: IncomingMessage, res: ServerResp
   if (!accountId) return json(res, 401, { error: "unauthorized" });
   const orderId = url.pathname.split("/")[3]; // /api/orders/:id/modify
   if (!orderId) return json(res, 400, { error: "order id is required" });
-  const body = await readJson<{ price?: number | null; stopLoss?: number | null; takeProfit?: number | null }>(req);
+  const body = await readJson<{ price?: number | null; stopLoss?: number | null; takeProfit?: number | null; quantity?: number }>(req);
   if (!body) return json(res, 400, { error: "invalid body" });
   const result = await engine.modify(accountId, decodeURIComponent(orderId), body);
   json(res, result.ok ? 200 : 400, result);

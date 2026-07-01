@@ -173,13 +173,20 @@ export class OrderEngine {
       const stopLossRequired = acc?.stopLossRequired ?? false;
       const hasSl = input.stopLoss != null || (input.slOffset != null && input.slOffset > 0);
       const hasTp = input.takeProfit != null || (input.tpOffset != null && input.tpOffset > 0);
-      if (!reduceOnly && stopLossRequired && !hasSl) {
-        await client.query("ROLLBACK");
-        return { ok: false, error: "A stop loss is required before entering a position." };
-      }
-      if (!reduceOnly && stopLossRequired && !hasTp) {
-        await client.query("ROLLBACK");
-        return { ok: false, error: "A take profit is required before entering a position." };
+      if (!reduceOnly && stopLossRequired) {
+        // Both missing → a single combined message; otherwise name the one that's absent.
+        if (!hasSl && !hasTp) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "A stop loss and take profit is required to enter a position." };
+        }
+        if (!hasSl) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "A stop loss is required before entering a position." };
+        }
+        if (!hasTp) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "A take profit is required before entering a position." };
+        }
       }
 
       const isMarket = input.type === "market";
@@ -428,12 +435,13 @@ export class OrderEngine {
    * drag-to-edit. `price` moves the order's own level (entry, or a bracket exit
    * leg). `stopLoss`/`takeProfit` move the attached bracket on an ENTRY order
    * (pass null to remove a leg); they don't apply to an exit leg, which has no
-   * bracket of its own. Each field is optional — only the dragged one is sent.
+   * bracket of its own. `quantity` resizes an ENTRY order before it fills. Each
+   * field is optional — only the changed one is sent.
    */
   async modify(
     accountId: string,
     orderId: string,
-    changes: { price?: number | null; stopLoss?: number | null; takeProfit?: number | null },
+    changes: { price?: number | null; stopLoss?: number | null; takeProfit?: number | null; quantity?: number },
   ): Promise<PlaceResult> {
     const client = await getPool().connect();
     try {
@@ -473,38 +481,35 @@ export class OrderEngine {
         return { ok: false, error: "This order has no attached bracket to modify." };
       }
 
+      // Resize a pending ENTRY order (an exit leg's size follows its position, so it's not
+      // editable here). Validated below against the per-trade risk cap using the NEW size.
+      let newQty = Number(row.quantity);
+      if (changes.quantity !== undefined) {
+        if (isExitLeg) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "An exit leg's size follows its position and can't be changed here." };
+        }
+        const q = Number(changes.quantity);
+        if (!Number.isFinite(q) || q <= 0) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: "Quantity must be a positive number." };
+        }
+        newQty = q;
+      }
+
       let newSl = row.slPrice != null ? Number(row.slPrice) : null;
       let newTp = row.tpPrice != null ? Number(row.tpPrice) : null;
       if (changes.stopLoss !== undefined) newSl = changes.stopLoss == null ? null : Number(changes.stopLoss);
       if (changes.takeProfit !== undefined) newTp = changes.takeProfit == null ? null : Number(changes.takeProfit);
 
-      // Enforce max risk per trade on ANY stop move — both a PENDING ENTRY order (entry vs
-      // its SL) AND the exit-leg STOP of a LIVE position (avg entry vs the stop). The latter
-      // was previously exempt, which let a trader pass the entry risk check with a tight stop
-      // and then drag the stop out past the cap — a prop-firm loophole. Now both are capped.
-      if (newPrice != null) {
-        let ref: number | null = null;
-        let stopPx: number | null = null;
-        if (!isExitLeg && newSl != null) {
-          ref = newPrice; // pending entry: risk = |entry − SL|
-          stopPx = newSl;
-        } else if (isExitLeg && row.type === "STOP") {
-          // Live exit stop: risk = |position avg − stop level|.
-          const posRes = await client.query<{ averagePrice: string }>(
-            `SELECT "averagePrice" FROM "Position" WHERE "accountId" = $1 AND "symbol" = $2`,
-            [accountId, row.symbol],
-          );
-          if (posRes.rows[0]) {
-            ref = Number(posRes.rows[0].averagePrice);
-            stopPx = newPrice;
-          }
-        }
-        if (ref != null && stopPx != null) {
-          const riskErr = await this.stopRiskError(client, accountId, row.symbol, ref, stopPx, Number(row.quantity));
-          if (riskErr) {
-            await client.query("ROLLBACK");
-            return { ok: false, error: riskErr };
-          }
+      // Max risk per trade applies ONLY at ENTRY — a PENDING entry order's entry-vs-SL
+      // distance. Once the trader is IN a position, moving the exit-leg STOP is intentionally
+      // NOT capped: they may widen the stop past the per-trade limit to manage the open trade.
+      if (newPrice != null && !isExitLeg && newSl != null) {
+        const riskErr = await this.stopRiskError(client, accountId, row.symbol, newPrice, newSl, newQty);
+        if (riskErr) {
+          await client.query("ROLLBACK");
+          return { ok: false, error: riskErr };
         }
       }
 
@@ -523,13 +528,13 @@ export class OrderEngine {
         `UPDATE "Order"
            SET "requestedPrice" = $2,
                "stopPrice" = CASE WHEN $3 THEN $2 ELSE "stopPrice" END,
-               "slPrice" = $4, "tpPrice" = $5, "updatedAt" = now()
+               "slPrice" = $4, "tpPrice" = $5, "quantity" = $6, "updatedAt" = now()
          WHERE "id" = $1`,
-        [orderId, newPrice, isStop, newSl, newTp],
+        [orderId, newPrice, isStop, newSl, newTp, newQty],
       );
       await this.log(
         client, accountId, "ORDER_MODIFIED",
-        `${row.side.toLowerCase()} ${row.symbol} ${row.type.toLowerCase()} → ${newPrice}${touchesBracket ? ` (SL ${newSl ?? "—"} / TP ${newTp ?? "—"})` : ""}`,
+        `${row.side.toLowerCase()} ${newQty} ${row.symbol} ${row.type.toLowerCase()} → ${newPrice}${touchesBracket ? ` (SL ${newSl ?? "—"} / TP ${newTp ?? "—"})` : ""}`,
       );
       await client.query("COMMIT");
 
@@ -607,15 +612,9 @@ export class OrderEngine {
         await client.query("ROLLBACK");
         return { ok: false, error: bErr };
       }
-      // Cap the stop's risk against max-risk-per-trade (avg entry vs the stop level), so a
-      // position bracket can't be set/widened beyond the per-trade limit.
-      if (newSl != null) {
-        const riskErr = await this.stopRiskError(client, accountId, symbol, avg, newSl, qty);
-        if (riskErr) {
-          await client.query("ROLLBACK");
-          return { ok: false, error: riskErr };
-        }
-      }
+      // No max-risk-per-trade cap here: the trader is already IN a position (a bracket on the
+      // open position line), so widening the stop past the per-trade limit is allowed. The cap
+      // only gates ENTRY — see placeOrder and modify's pending-entry branch.
       await this.createBracketChildren(client, accountId, symbol, entrySide, qty, newSl, newTp);
       await client.query("COMMIT");
       this.accountStream.publishOrderUpdate(accountId, { symbol, status: "open" });

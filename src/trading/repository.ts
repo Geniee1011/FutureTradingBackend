@@ -234,11 +234,12 @@ export interface AccountSnapshot {
   status: string;
   statusReason: string | null; // why a non-ACTIVE account is in that state (the breach detail)
   dayStartEquity: number; // equity at the start of the current trading day
+  highestEquity: number; // persisted all-time high-water mark (basis for trailing drawdown)
 }
 
 export async function getAccountSnapshot(accountId: string): Promise<AccountSnapshot | null> {
   const { rows } = await getPool().query(
-    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity" FROM "Account" WHERE "id" = $1`,
+    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity","highestEquity" FROM "Account" WHERE "id" = $1`,
     [accountId],
   );
   const r = rows[0];
@@ -260,6 +261,7 @@ export async function getAccountSnapshot(accountId: string): Promise<AccountSnap
     status: r.status,
     statusReason,
     dayStartEquity: r.dayStartEquity != null ? Number(r.dayStartEquity) : Number(r.startingBalance),
+    highestEquity: r.highestEquity != null ? Number(r.highestEquity) : Number(r.startingBalance),
   };
 }
 

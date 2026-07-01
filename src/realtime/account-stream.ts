@@ -134,9 +134,10 @@ export class AccountStream {
 
   /**
    * Drop the trailing high-water mark so live drawdown is recomputed from the (reset)
-   * equity — call after an admin reset. The peak otherwise ratchets only upward, so it
+   * account — call after an admin reset. The peak otherwise ratchets only upward, so it
    * would keep reporting the pre-reset drawdown against the old high. Next tick re-seeds
-   * it from the fresh equity (= starting balance), giving a $0 drawdown.
+   * it from the reloaded snapshot's highestEquity (reset to the starting balance), giving
+   * a $0 drawdown. Requires refreshAccount() to run FIRST so the snapshot is fresh.
    */
   resetDrawdownPeak(accountId: string) {
     this.peaks.delete(accountId);
@@ -194,7 +195,12 @@ export class AccountStream {
     // (cash + unrealized), and keep a trailing peak for live drawdown reporting.
     for (const [accountId, acc] of this.accounts) {
       const equity = acc.snapshot.balance + this.unrealizedFor(acc);
-      this.peaks.set(accountId, Math.max(this.peaks.get(accountId) ?? equity, equity));
+      // Seed the trailing peak from the PERSISTED all-time high-water mark (highestEquity),
+      // not merely current equity — otherwise a backend restart (or first account load) while
+      // the account is down would anchor the peak at the down equity and drastically
+      // under-report the trailing drawdown. It still ratchets up live as equity makes new highs.
+      const prevPeak = this.peaks.get(accountId) ?? acc.snapshot.highestEquity;
+      this.peaks.set(accountId, Math.max(prevPeak, acc.snapshot.highestEquity, equity));
       if (this.risk) void this.risk.evaluate(accountId, equity).catch((e) => this.warnRisk(e));
     }
     for (const [ws, st] of this.clients) this.pushAccount(ws, st);
@@ -251,7 +257,9 @@ export class AccountStream {
 
     if (st.channels.has("account-updates")) {
       const equity = acc.snapshot.balance + unrealized;
-      const peak = this.peaks.get(accountId) ?? equity;
+      // Same high-water-mark basis as tick(): fall back to the persisted peak, never to the
+      // (possibly-down) current equity, so a fresh subscribe before the first tick is correct too.
+      const peak = Math.max(this.peaks.get(accountId) ?? acc.snapshot.highestEquity, equity);
       this.send(ws, {
         type: "account_update",
         channel: "account-updates",
