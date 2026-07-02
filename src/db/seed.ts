@@ -178,38 +178,46 @@ export async function runSeed(): Promise<void> {
     // history. Realized P&L = (exit−entry) for longs / (entry−exit) for shorts,
     // × qty × contract multiplier, rounded to cents. Idempotent: reset first.
     await pool.query(`DELETE FROM "ClosedPosition" WHERE "accountId" = $1`, [accountId]);
+    await pool.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
     const closedTrades = [
       { symbol: "MES", side: "LONG", qty: 1, entry: roundTo("MES", markOf("ES") - 12), exit: roundTo("MES", markOf("ES") - 2), dOpen: 5, dClose: 4 },
       { symbol: "MNQ", side: "SHORT", qty: 2, entry: roundTo("MNQ", markOf("NQ") + 30), exit: roundTo("MNQ", markOf("NQ") + 10), dOpen: 4, dClose: 3 },
       { symbol: "MCL", side: "LONG", qty: 1, entry: roundTo("MCL", markOf("CL") + 0.3), exit: roundTo("MCL", markOf("CL") + 0.1), dOpen: 3, dClose: 2 }, // red
       { symbol: "MGC", side: "LONG", qty: 1, entry: roundTo("MGC", markOf("GC") - 6), exit: roundTo("MGC", markOf("GC") - 1), dOpen: 2, dClose: 1 },
     ];
+    // Each closed round-trip books BOTH a ClosedPosition (admin "Closed" tab) AND a matching
+    // TRADE ledger entry (trader portal transaction history) from the SAME realized P&L and the
+    // SAME close time — exactly as the live order engine does (settleFill). This is what keeps the
+    // two views reconciled: the ledger's TRADE rows sum to the ClosedPosition realized total.
+    const tradeTxns: { type: string; amount: number; desc: string; at: Date }[] = [];
     for (const c of closedTrades) {
       const mult = getInstrument(c.symbol)!.multiplier;
       const realized = Math.round((c.side === "LONG" ? c.exit - c.entry : c.entry - c.exit) * c.qty * mult * 100) / 100;
+      const closedAt = new Date(Date.now() - c.dClose * 86_400_000);
       await pool.query(
         `INSERT INTO "ClosedPosition" ("accountId","symbol","side","quantity","entryPrice","exitPrice","realizedPnl","openedAt","closedAt")
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
         [accountId, c.symbol, c.side, c.qty, c.entry, c.exit, realized,
-         new Date(Date.now() - c.dOpen * 86_400_000), new Date(Date.now() - c.dClose * 86_400_000)],
+         new Date(Date.now() - c.dOpen * 86_400_000), closedAt],
       );
+      tradeTxns.push({ type: "TRADE", amount: realized, desc: `Realized P&L · ${c.symbol}`, at: closedAt });
     }
 
-    // Transaction history.
-    await pool.query(`DELETE FROM "Transaction" WHERE "accountId" = $1`, [accountId]);
+    // Transaction history = the derived TRADE rows above (one per closed trade, reconciled)
+    // plus non-trade ledger flavour (deposit / fees / funding) that legitimately has no
+    // closed-trade counterpart. Sorted by time on read, so ordering here doesn't matter.
     const txns = [
-      { type: "DEPOSIT", amount: 50000, desc: "Initial deposit", daysAgo: 30 },
-      { type: "TRADE", amount: 1240.0, desc: "Realized P&L · MES", daysAgo: 3 },
-      { type: "FEE", amount: -4.5, desc: "Trading commission", daysAgo: 3 },
-      { type: "TRADE", amount: -380.5, desc: "Realized P&L · MNQ", daysAgo: 2 },
-      { type: "FUNDING", amount: -12.2, desc: "Overnight funding", daysAgo: 1 },
-      { type: "FEE", amount: -8.0, desc: "Trading commission", daysAgo: 0 },
+      { type: "DEPOSIT", amount: 50000, desc: "Initial deposit", at: new Date(Date.now() - 30 * 86_400_000) },
+      ...tradeTxns,
+      { type: "FEE", amount: -4.5, desc: "Trading commission", at: new Date(Date.now() - 3 * 86_400_000) },
+      { type: "FUNDING", amount: -12.2, desc: "Overnight funding", at: new Date(Date.now() - 1 * 86_400_000) },
+      { type: "FEE", amount: -8.0, desc: "Trading commission", at: new Date(Date.now()) },
     ];
     for (const t of txns) {
       await pool.query(
         `INSERT INTO "Transaction" ("accountId","type","amount","description","createdAt")
          VALUES ($1,$2,$3,$4,$5)`,
-        [accountId, t.type, t.amount, t.desc, new Date(Date.now() - t.daysAgo * 86_400_000)],
+        [accountId, t.type, t.amount, t.desc, t.at],
       );
     }
 

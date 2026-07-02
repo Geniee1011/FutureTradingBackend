@@ -65,8 +65,28 @@ accountStream.start();
 // Model B: the shared provider streams nothing (no one subscribes to it), so feed
 // each user's real per-user live prices into the mark map — this is what gives the
 // execution engine fill prices for market orders and live marks for position P&L.
+let houseFeed: DatabentoLiveProvider | null = null;
 if (config.marketDataMode === "byo") {
   byoSessions.setMarkSink((symbol, price) => accountStream.setExternalMark(symbol, price));
+
+  // House mark feed: ONE always-on server-side LIVE session on the operator's own key
+  // (DATABENTO_API_KEY), used purely for INTERNAL marks — admin P&L, resting SL/TP/limit
+  // triggering, and market-order fills. Without it the mark map only warms while some
+  // trader session is live, so with everyone offline (or right after a restart) the admin
+  // P&L reads $0 and resting stop-losses never fire. This is NOT wired into MarketHub, so
+  // it's never fanned out to users as chart data — charts stay strictly per-user (their own
+  // key via REST), preserving Model B's no-redistribution property for market data.
+  if (useDatabento && config.databento.live && config.databento.apiKey) {
+    houseFeed = new DatabentoLiveProvider(config.databento.apiKey, config.databento.dataset);
+    houseFeed.on("quote", (q) => accountStream.setExternalMark(q.symbol, q.price));
+    houseFeed.start();
+    console.log("[provider] House mark feed (Databento LIVE, operator key) — internal marks only, all instruments");
+  } else {
+    console.warn(
+      "[provider] BYO mode without a house mark feed (DATABENTO_API_KEY / DATABENTO_LIVE unset): " +
+        "admin P&L and resting-order triggering only work while a trader session is live.",
+    );
+  }
 }
 
 // Order engine (real, Postgres-backed) — fills market orders, nets positions,
@@ -137,6 +157,7 @@ server.listen(config.port, () => {
 function shutdown() {
   console.log("\nShutting down…");
   hub.stop();
+  houseFeed?.stop();
   accountStream.stop();
   orderEngine.stop();
   server.close(() => process.exit(0));
