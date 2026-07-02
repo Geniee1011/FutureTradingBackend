@@ -858,17 +858,14 @@ export class OrderEngine {
     minHoldTimeSecs = 0,
   ): Promise<number> {
     const dir = side === "LONG" ? 1 : -1;
-    const now = Date.now();
-    const realizedOf = (entry: number, q: number, openedAt: Date | undefined) => {
-      const pnl = Math.round((fillPrice - entry) * q * dir * multiplier * 100) / 100;
-      // Min-hold-time rule: if a trade is closed with profit before the minimum hold
-      // time, the profit does not count. A loss is always real.
-      if (minHoldTimeSecs > 0 && pnl > 0 && openedAt) {
-        const heldMs = now - new Date(openedAt).getTime();
-        if (heldMs < minHoldTimeSecs * 1000) return 0;
-      }
-      return pnl;
-    };
+    // Realized P&L is ALWAYS the true (exit − entry) × qty × direction × contract value.
+    // We deliberately do NOT zero out fast profits here: booking $0.00 on a trade whose entry
+    // and exit clearly differ reads as a bug to users and breaks P&L reconciliation (the closed
+    // blotter must equal the cash ledger). The minimum-hold-time (anti-scalp) rule, if enforced,
+    // must be surfaced as a FLAGGED violation on the trade — never by falsifying the booked
+    // number. (`minHoldTimeSecs` is still threaded through for that future flag-based use.)
+    const realizedOf = (entry: number, q: number) =>
+      Math.round((fillPrice - entry) * q * dir * multiplier * 100) / 100;
     let remaining = closeQty;
     let total = 0;
     const { rows } = await client.query<{ id: string; quantity: number; entryPrice: string; openedAt: Date }>(
@@ -881,7 +878,7 @@ export class OrderEngine {
       const lotQty = Number(lot.quantity);
       const take = Math.min(remaining, lotQty);
       const entry = Number(lot.entryPrice);
-      const realized = realizedOf(entry, take, lot.openedAt);
+      const realized = realizedOf(entry, take);
       total += realized;
       // One closed-trade row per lot — its real entry price + open time, not the blend.
       await this.recordClosedPosition(client, accountId, symbol, side, take, entry, fillPrice, realized, lot.openedAt);
@@ -895,7 +892,7 @@ export class OrderEngine {
     // Defensive: lots didn't fully back the position — book the remainder at the position
     // average so the closed-trades log and realized P&L stay complete.
     if (remaining > 0) {
-      const realized = realizedOf(fallbackEntry, remaining, fallbackOpenedAt);
+      const realized = realizedOf(fallbackEntry, remaining);
       total += realized;
       await this.recordClosedPosition(client, accountId, symbol, side, remaining, fallbackEntry, fillPrice, realized, fallbackOpenedAt);
     }
