@@ -737,6 +737,10 @@ export class OrderEngine {
   ): Promise<PositionOutcome> {
     const existing = await this.getPosition(client, accountId, symbol);
     const round = (v: number) => Math.round(v * 10 ** precision) / 10 ** precision;
+    // The averaged entry keeps the column's full 4dp precision (not display precision) so the
+    // netted position's unrealized P&L equals the SUM of the per-lot P&L — no half-cent drift
+    // between the trader's chart and the admin per-trade panel.
+    const round4 = (v: number) => Math.round(v * 1e4) / 1e4;
     const posSide: PosSide = side === "buy" ? "LONG" : "SHORT";
 
     if (!existing) {
@@ -756,14 +760,17 @@ export class OrderEngine {
 
     if (sameDir) {
       const newQty = existing.quantity + qty;
-      const newAvg = round((existing.averagePrice * existing.quantity + fillPrice * qty) / newQty);
+      // Average the LOT entry price (what the per-lot panel sums), at full 4dp precision, so the
+      // netted avg == weighted mean of the lots and both P&L views reconcile to the cent.
+      const lotPrice = round(fillPrice);
+      const newAvg = round4((existing.averagePrice * existing.quantity + lotPrice * qty) / newQty);
       await client.query(
         `UPDATE "Position" SET "quantity" = $2, "averagePrice" = $3, "updatedAt" = now() WHERE "id" = $1`,
         [existing.id, newQty, newAvg],
       );
       // A scale-in is a SEPARATE trade in the CRM — record its own lot (not merged
       // into the existing one), even though the netted Position line above averages them.
-      await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice));
+      await this.insertLot(client, accountId, symbol, side, qty, lotPrice);
       return { realized: 0, side: existing.side, qty: newQty };
     }
 
