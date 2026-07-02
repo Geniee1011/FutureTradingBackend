@@ -787,13 +787,23 @@ export class OrderEngine {
     );
 
     if (qty < existing.quantity) {
-      // Reduce: position stays on its EXISTING side (opposite the incoming order).
-      await client.query(`UPDATE "Position" SET "quantity" = $2, "realizedPnl" = "realizedPnl" + $3, "updatedAt" = now() WHERE "id" = $1`, [
+      // Reduce: position stays on its EXISTING side (opposite the incoming order). FIFO closed
+      // the OLDEST lots above, so re-derive the netted average from the SURVIVING lots — else the
+      // Position keeps the stale pre-reduce blend and its avg/P&L drift from the per-lot panel.
+      const remainingQty = existing.quantity - qty;
+      const avgRow = await client.query<{ avg: string | null }>(
+        `SELECT SUM("entryPrice" * "quantity") / NULLIF(SUM("quantity"), 0) AS avg
+         FROM "PositionLot" WHERE "accountId" = $1 AND "symbol" = $2`,
+        [accountId, symbol],
+      );
+      const newAvg = avgRow.rows[0]?.avg != null ? round4(Number(avgRow.rows[0].avg)) : existing.averagePrice;
+      await client.query(`UPDATE "Position" SET "quantity" = $2, "averagePrice" = $3, "realizedPnl" = "realizedPnl" + $4, "updatedAt" = now() WHERE "id" = $1`, [
         existing.id,
-        existing.quantity - qty,
+        remainingQty,
+        newAvg,
         realized,
       ]);
-      return { realized, side: existing.side, qty: existing.quantity - qty };
+      return { realized, side: existing.side, qty: remainingQty };
     } else if (qty === existing.quantity) {
       await client.query(`DELETE FROM "Position" WHERE "id" = $1`, [existing.id]); // lots fully booked above
       await this.log(client, accountId, "POSITION_CLOSED", `${symbol} flat (realized ${realized})`);
