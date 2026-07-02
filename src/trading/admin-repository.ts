@@ -312,11 +312,11 @@ export async function adminListOpenPositions(
     const mark = markOf?.(r.symbol);
     const unrealizedPnl =
       mark != null && mark > 0 ? Math.round((mark - entry) * lotQty * dir * getMultiplier(r.symbol) * 100) / 100 : 0;
-    // Booked (realized) P&L of the still-open position, split across its lots by size so
-    // the per-trade rows sum to the position total (a fresh, never-reduced trade → $0).
-    const posQty = r.posQty != null ? Number(r.posQty) : lotQty;
-    const posRealized = r.posRealized != null ? Number(r.posRealized) : 0;
-    const realizedPnl = posQty > 0 ? Math.round(posRealized * (lotQty / posQty) * 100) / 100 : 0;
+    // An OPEN lot has booked NOTHING — realized P&L is recognised only when a lot CLOSES
+    // (recorded in ClosedPosition → the "Closed" tab). Previously the netted position's
+    // accumulated realized was smeared across the surviving lots, so a trade you'd already
+    // closed showed its P&L on a still-open, separate trade. Each open trade reads $0 booked.
+    const realizedPnl = 0;
     return {
       id: r.id,
       traderId: r.traderId,
