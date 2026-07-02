@@ -63,6 +63,14 @@ interface PositionRow {
   openedAt?: Date;
 }
 
+type PosSide = "LONG" | "SHORT";
+/** Net position state after a fill — drives whether/how the protective bracket is (re)built. */
+interface PositionOutcome {
+  realized: number;
+  side: PosSide | null; // net side after the fill; null = flat (position closed)
+  qty: number; // net position quantity after the fill
+}
+
 interface WorkingOrder {
   id: string;
   accountId: string;
@@ -272,16 +280,15 @@ export class OrderEngine {
         [accountId, input.symbol, input.side.toUpperCase(), input.quantity, fillPrice],
       );
       const orderId = ord.rows[0]!.id;
-      const realized = await this.settleFill(
+      const outcome = await this.settleFill(
         client, accountId, orderId, input.symbol, input.side, input.quantity, fillPrice, inst.pricePrecision,
         minHoldTimeSecs,
       );
+      const realized = outcome.realized;
       await this.log(client, accountId, "ORDER_FILLED", `${input.side} ${input.quantity} ${input.symbol} @ ${fillPrice}`);
 
-      // Attach the bracket: opposing stop (SL) + limit (TP), OCO-linked.
-      if (slPrice != null || tpPrice != null) {
-        await this.createBracketChildren(client, accountId, input.symbol, input.side, input.quantity, slPrice, tpPrice);
-      }
+      // Attach/adjust the bracket only if this fill opened/added/flipped into the order's side.
+      await this.reconcileBracket(client, accountId, input.symbol, input.side, outcome, slPrice, tpPrice);
 
       await client.query("COMMIT");
 
@@ -727,20 +734,21 @@ export class OrderEngine {
     fillPrice: number,
     precision: number,
     minHoldTimeSecs = 0,
-  ): Promise<number> {
+  ): Promise<PositionOutcome> {
     const existing = await this.getPosition(client, accountId, symbol);
     const round = (v: number) => Math.round(v * 10 ** precision) / 10 ** precision;
+    const posSide: PosSide = side === "buy" ? "LONG" : "SHORT";
 
     if (!existing) {
       await client.query(
         `INSERT INTO "Position" ("accountId","symbol","side","quantity","averagePrice")
          VALUES ($1,$2,$3,$4,$5)`,
-        [accountId, symbol, side === "buy" ? "LONG" : "SHORT", qty, round(fillPrice)],
+        [accountId, symbol, posSide, qty, round(fillPrice)],
       );
       // First lot of a brand-new position (admin CRM lists trades separately).
       await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice));
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty} ${symbol} @ ${round(fillPrice)}`);
-      return 0;
+      return { realized: 0, side: posSide, qty };
     }
 
     const sameDir = (existing.side === "LONG" && side === "buy") || (existing.side === "SHORT" && side === "sell");
@@ -756,7 +764,7 @@ export class OrderEngine {
       // A scale-in is a SEPARATE trade in the CRM — record its own lot (not merged
       // into the existing one), even though the netted Position line above averages them.
       await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice));
-      return 0;
+      return { realized: 0, side: existing.side, qty: newQty };
     }
 
     // Opposing order: reduce, close, or flip. Close the oldest OPEN lots first (FIFO),
@@ -772,26 +780,29 @@ export class OrderEngine {
     );
 
     if (qty < existing.quantity) {
+      // Reduce: position stays on its EXISTING side (opposite the incoming order).
       await client.query(`UPDATE "Position" SET "quantity" = $2, "realizedPnl" = "realizedPnl" + $3, "updatedAt" = now() WHERE "id" = $1`, [
         existing.id,
         existing.quantity - qty,
         realized,
       ]);
+      return { realized, side: existing.side, qty: existing.quantity - qty };
     } else if (qty === existing.quantity) {
       await client.query(`DELETE FROM "Position" WHERE "id" = $1`, [existing.id]); // lots fully booked above
       await this.log(client, accountId, "POSITION_CLOSED", `${symbol} flat (realized ${realized})`);
+      return { realized, side: null, qty: 0 };
     } else {
       // Flip: the old side is fully closed (its lots booked above); the remainder opens a
       // fresh lot on the new side.
       await client.query(
         `UPDATE "Position" SET "side" = $2, "quantity" = $3, "averagePrice" = $4, "realizedPnl" = "realizedPnl" + $5, "updatedAt" = now() WHERE "id" = $1`,
-        [existing.id, side === "buy" ? "LONG" : "SHORT", qty - existing.quantity, round(fillPrice), realized],
+        [existing.id, posSide, qty - existing.quantity, round(fillPrice), realized],
       );
       await this.insertLot(client, accountId, symbol, side, qty - existing.quantity, round(fillPrice));
       await this.log(client, accountId, "POSITION_CLOSED", `${existing.side.toLowerCase()} ${symbol} closed (realized ${realized})`);
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty - existing.quantity} ${symbol} @ ${round(fillPrice)}`);
+      return { realized, side: posSide, qty: qty - existing.quantity };
     }
-    return realized;
   }
 
   /** Record one open lot — a single entry trade — for the per-trade admin CRM view. */
@@ -894,7 +905,7 @@ export class OrderEngine {
     );
   }
 
-  /** Write the Fill, net it into the position, and book realized P&L. Returns realized. */
+  /** Write the Fill, net it into the position, book realized P&L. Returns the net position outcome. */
   private async settleFill(
     client: PoolClient,
     accountId: string,
@@ -905,21 +916,68 @@ export class OrderEngine {
     fillPrice: number,
     precision: number,
     minHoldTimeSecs = 0,
-  ): Promise<number> {
+  ): Promise<PositionOutcome> {
     await client.query(`INSERT INTO "Fill" ("orderId","quantity","price") VALUES ($1,$2,$3)`, [orderId, qty, fillPrice]);
-    const realized = await this.applyToPosition(client, accountId, symbol, side, qty, fillPrice, precision, minHoldTimeSecs);
-    if (realized !== 0) {
+    const outcome = await this.applyToPosition(client, accountId, symbol, side, qty, fillPrice, precision, minHoldTimeSecs);
+    if (outcome.realized !== 0) {
       await client.query(
         `UPDATE "Account" SET "balance" = "balance" + $2, "totalPnl" = "totalPnl" + $2,
                 "dailyPnl" = "dailyPnl" + $2, "updatedAt" = now() WHERE "id" = $1`,
-        [accountId, realized],
+        [accountId, outcome.realized],
       );
       await client.query(
         `INSERT INTO "Transaction" ("accountId","type","amount","description") VALUES ($1,'TRADE',$2,$3)`,
-        [accountId, realized, `Realized P&L · ${symbol}`],
+        [accountId, outcome.realized, `Realized P&L · ${symbol}`],
       );
     }
-    return realized;
+    return outcome;
+  }
+
+  /** Cancel any resting protective bracket legs for a symbol (e.g. after a fill flattens it). */
+  private async cancelRestingBracket(client: PoolClient, accountId: string, symbol: string): Promise<void> {
+    await client.query(
+      `UPDATE "Order" SET "status" = 'CANCELLED', "reason" = 'position flat', "updatedAt" = now()
+       WHERE "accountId" = $1 AND "symbol" = $2 AND "status" = 'PENDING' AND "ocoGroupId" IS NOT NULL`,
+      [accountId, symbol],
+    );
+  }
+
+  /** Shrink the resting bracket legs to `qty` (after a partial reduce) so they can't over-fill
+   *  and flip the position when hit. */
+  private async resizeRestingBracket(client: PoolClient, accountId: string, symbol: string, qty: number): Promise<void> {
+    await client.query(
+      `UPDATE "Order" SET "quantity" = $3, "updatedAt" = now()
+       WHERE "accountId" = $1 AND "symbol" = $2 AND "status" = 'PENDING' AND "ocoGroupId" IS NOT NULL`,
+      [accountId, symbol, qty],
+    );
+  }
+
+  /**
+   * Decide the protective bracket after a fill. Only (re)build it when the fill leaves a net
+   * position ON THE ORDER'S OWN SIDE (open / add / flip) — a fill that merely REDUCES the
+   * opposite side is an exit and must not spawn a (wrong-way) bracket. A full close cancels
+   * the resting legs. This is what stops a reducing SELL from flipping a long's TP/SL.
+   */
+  private async reconcileBracket(
+    client: PoolClient,
+    accountId: string,
+    symbol: string,
+    orderSide: ApiSide,
+    outcome: PositionOutcome,
+    slPrice: number | null,
+    tpPrice: number | null,
+  ): Promise<void> {
+    const orderPosSide: PosSide = orderSide === "buy" ? "LONG" : "SHORT";
+    if ((slPrice != null || tpPrice != null) && outcome.side === orderPosSide) {
+      // Opened / added / flipped into the order's side → (re)build the bracket for the net size.
+      await this.createBracketChildren(client, accountId, symbol, orderSide, outcome.qty, slPrice, tpPrice);
+    } else if (outcome.side === null) {
+      // Position went flat → drop the now-orphaned protective legs.
+      await this.cancelRestingBracket(client, accountId, symbol);
+    } else if (outcome.side !== orderPosSide) {
+      // Reduced the opposite side → keep the existing bracket but shrink it to the smaller size.
+      await this.resizeRestingBracket(client, accountId, symbol, outcome.qty);
+    }
   }
 
   // --- resting-order monitor (limit/stop triggering) ---------------
@@ -1040,7 +1098,7 @@ export class OrderEngine {
         `UPDATE "Order" SET "status" = 'FILLED', "filledQuantity" = $2, "fillPrice" = $3, "updatedAt" = now() WHERE "id" = $1`,
         [o.id, qty, fillPrice],
       );
-      await this.settleFill(client, o.accountId, o.id, o.symbol, side, qty, fillPrice, inst.pricePrecision, minHoldTimeSecs);
+      const outcome = await this.settleFill(client, o.accountId, o.id, o.symbol, side, qty, fillPrice, inst.pricePrecision, minHoldTimeSecs);
       await this.log(client, o.accountId, "ORDER_FILLED", `${side} ${qty} ${o.symbol} @ ${fillPrice} (${o.type.toLowerCase()})`);
 
       // OCO: this leg filled → cancel its sibling. (A bracket exit leg has an ocoGroupId.)
@@ -1051,12 +1109,11 @@ export class OrderEngine {
           [o.ocoGroupId, o.id],
         );
       }
-      // A bracket ENTRY (limit/stop with SL/TP) just filled → spawn its exit legs.
+      // A bracket ENTRY (limit/stop with SL/TP) that OPENED/ADDED/FLIPPED into its own side just
+      // filled → (re)build its exit legs; a fill that only reduced the other side spawns nothing.
       const slPrice = o.slPrice != null ? Number(o.slPrice) : null;
       const tpPrice = o.tpPrice != null ? Number(o.tpPrice) : null;
-      if (slPrice != null || tpPrice != null) {
-        await this.createBracketChildren(client, o.accountId, o.symbol, side, qty, slPrice, tpPrice);
-      }
+      await this.reconcileBracket(client, o.accountId, o.symbol, side, outcome, slPrice, tpPrice);
 
       await client.query("COMMIT");
 
