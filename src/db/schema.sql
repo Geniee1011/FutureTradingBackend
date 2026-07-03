@@ -226,6 +226,10 @@ ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "challengePhase" smallint NOT NUL
 ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "pendingReviewAt" timestamptz;
 CREATE INDEX IF NOT EXISTS "Account_pendingReview_idx" ON "Account" ("pendingReviewAt") WHERE "pendingReviewAt" IS NOT NULL;
 
+-- Self-service reset: a FAILED trader can request a reset from the fail banner. A background
+-- sweeper auto-resets the account 12h after the request. Cleared when the reset is applied.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "resetRequestedAt" timestamptz;
+
 -- EOD trailing drawdown state.
 -- peakIntradayEquity: highest equity (balance + unrealized) reached in the CURRENT
 --   session; resets each day. Used to snapshot the EOD peak at session close.

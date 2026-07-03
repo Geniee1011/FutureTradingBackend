@@ -45,16 +45,52 @@ interface CachedAccount {
   positions: ApiPosition[];
 }
 
+// Outlier-mark guard. A single bad print (e.g. a feed glitch quoting 2× the real price)
+// spikes unrealized P&L → equity → the trailing high-water mark, which never comes back down,
+// so the account then FAILS on a spurious drawdown when the price normalizes. We drop any tick
+// that jumps more than MAX_MARK_JUMP from the last accepted price — UNLESS it persists for
+// MAX_CONSEC_REJECTS ticks (a genuine fast move / stale baseline), then we accept it. These
+// futures effectively never move >25% in one print, so this only ever catches bad data.
+const MAX_MARK_JUMP = 0.25;
+const MAX_CONSEC_REJECTS = 3;
+
 export class AccountStream {
   private clients = new Map<WebSocket, ClientState>();
-  private quotes = new Map<string, number>(); // symbol → latest price
+  private quotes = new Map<string, number>(); // symbol → latest (validated) price
+  private markRejects = new Map<string, number>(); // symbol → consecutive outlier rejections
   private accounts = new Map<string, CachedAccount>(); // accountId → cached data
   private peaks = new Map<string, number>(); // accountId → trailing peak equity (for live drawdown)
   private timer: NodeJS.Timeout | null = null;
   private risk: { evaluate(accountId: string, equity: number): Promise<void> } | null = null;
 
   constructor(provider: MarketDataProvider) {
-    provider.on("quote", (q) => this.quotes.set(q.symbol, q.price));
+    provider.on("quote", (q) => this.updateMark(q.symbol, q.price));
+  }
+
+  /**
+   * Validate + store a mark, rejecting outlier ticks (see MAX_MARK_JUMP) so one bad print can't
+   * corrupt equity / the trailing drawdown peak. All mark sources (shared feed + byo/house feed
+   * via setExternalMark) funnel through here.
+   */
+  private updateMark(symbol: string, price: number): void {
+    if (!(price > 0)) return;
+    const last = this.quotes.get(symbol);
+    if (last != null && last > 0) {
+      const jump = Math.abs(price - last) / last;
+      if (jump > MAX_MARK_JUMP) {
+        const n = (this.markRejects.get(symbol) ?? 0) + 1;
+        if (n < MAX_CONSEC_REJECTS) {
+          this.markRejects.set(symbol, n);
+          if (n === 1)
+            console.warn(`[marks] ignored outlier ${symbol}: ${last} → ${price} (${(jump * 100).toFixed(0)}% jump)`);
+          return; // drop this bad tick, keep the last good price
+        }
+        // Sustained beyond the baseline for MAX_CONSEC_REJECTS ticks → the market genuinely moved
+        // (or our baseline was stale). Accept it.
+      }
+    }
+    this.markRejects.set(symbol, 0);
+    this.quotes.set(symbol, price);
   }
 
   /** Wire the risk engine (set after construction to avoid a circular dependency). */
@@ -187,7 +223,7 @@ export class AccountStream {
    * A symbol's price is the same for every user, so a single global map is correct.
    */
   setExternalMark(symbol: string, price: number): void {
-    if (price > 0) this.quotes.set(symbol, price);
+    this.updateMark(symbol, price); // same outlier guard as the shared feed
   }
 
   private tick() {
@@ -268,6 +304,7 @@ export class AccountStream {
         pendingReview: acc.snapshot.pendingReview, // hit profit target → awaiting admin review (trader is congratulated)
         tradingPaused: acc.snapshot.tradingPaused, // hit daily-loss limit today → positions closed, paused till tomorrow
         tradingPausedReason: acc.snapshot.tradingPausedReason,
+        resetRequestedAt: acc.snapshot.resetRequestedAt, // FAILED: reset requested → auto-applies 12h later
         balance: round(acc.snapshot.balance, 2),
         equity: round(equity, 2),
         unrealizedPnl: round(unrealized, 2),

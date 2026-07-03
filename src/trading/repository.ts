@@ -238,11 +238,15 @@ export interface AccountSnapshot {
   pendingReview: boolean; // reached profit target → awaiting admin Approve/Disapprove
   tradingPaused: boolean; // hit the daily-loss limit TODAY → positions closed, orders blocked until tomorrow
   tradingPausedReason: string | null; // the daily-limit breach detail
+  resetRequestedAt: number | null; // FAILED account: trader requested a reset (auto-applies 12h later)
 }
+
+/** Hours after a reset request that the background sweeper auto-resets the account. */
+export const AUTO_RESET_HOURS = 12;
 
 export async function getAccountSnapshot(accountId: string): Promise<AccountSnapshot | null> {
   const { rows } = await getPool().query(
-    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity","highestEquity","pendingReviewAt",
+    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity","highestEquity","pendingReviewAt","resetRequestedAt",
             ("tradingPausedAt" = CURRENT_DATE) AS "tradingPausedToday"
      FROM "Account" WHERE "id" = $1`,
     [accountId],
@@ -281,7 +285,25 @@ export async function getAccountSnapshot(accountId: string): Promise<AccountSnap
     pendingReview: r.pendingReviewAt != null,
     tradingPaused,
     tradingPausedReason,
+    resetRequestedAt: r.resetRequestedAt != null ? new Date(r.resetRequestedAt).getTime() : null,
   };
+}
+
+/**
+ * A FAILED account's owner requests a self-service reset. Records the request time; the
+ * background sweeper applies the reset AUTO_RESET_HOURS (12h) later. Idempotent — a repeat
+ * request keeps the original timestamp (doesn't push the clock back). Only FAILED accounts.
+ */
+export async function requestAccountReset(
+  accountId: string,
+): Promise<{ ok: boolean; error?: string; resetRequestedAt?: number }> {
+  const { rows } = await getPool().query<{ resetRequestedAt: Date }>(
+    `UPDATE "Account" SET "resetRequestedAt" = COALESCE("resetRequestedAt", now()), "updatedAt" = now()
+     WHERE "id" = $1 AND "status" = 'FAILED' RETURNING "resetRequestedAt"`,
+    [accountId],
+  );
+  if (rows.length === 0) return { ok: false, error: "Only a failed account can request a reset." };
+  return { ok: true, resetRequestedAt: new Date(rows[0]!.resetRequestedAt).getTime() };
 }
 
 export interface ApiPosition {

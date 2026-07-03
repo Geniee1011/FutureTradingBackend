@@ -786,7 +786,7 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
               "dailyPnl" = 0, "totalPnl" = 0, "drawdown" = 0, "highestEquity" = "startingBalance",
               "dayStartEquity" = "startingBalance", "dayStartAt" = CURRENT_DATE,
               "peakIntradayEquity" = "startingBalance", "eodPeakEquity" = "startingBalance",
-              "tradingPausedAt" = NULL, "pendingReviewAt" = NULL,
+              "tradingPausedAt" = NULL, "pendingReviewAt" = NULL, "resetRequestedAt" = NULL,
               "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
       [accountId],
     );
@@ -852,7 +852,7 @@ export async function adminAssignTier(accountId: string, templateId: string, rea
          "drawdown" = 0, "highestEquity" = $3,
          "dayStartEquity" = $3, "dayStartAt" = CURRENT_DATE,
          "peakIntradayEquity" = $3, "eodPeakEquity" = $3,
-         "tradingPausedAt" = NULL, "pendingReviewAt" = NULL, "challengePhase" = $4,
+         "tradingPausedAt" = NULL, "pendingReviewAt" = NULL, "resetRequestedAt" = NULL, "challengePhase" = $4,
          "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now()
        WHERE "id" = $1`,
       [accountId, templateId, size, challengePhase],

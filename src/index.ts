@@ -15,6 +15,7 @@ import { byoSessions } from "./market-data/byo-session.js";
 import { AccountStream } from "./realtime/account-stream.js";
 import { OrderEngine } from "./trading/order-engine.js";
 import { RiskEngine } from "./trading/risk-engine.js";
+import { startResetSweeper } from "./trading/reset-sweeper.js";
 
 function buildProvider(): MarketDataProvider {
   // Model B — "byo": per-user (bring-your-own) Databento accounts. Chart data
@@ -98,6 +99,9 @@ orderEngine.start();
 // Driven by the AccountStream tick on live equity; liquidates + fails or passes.
 const riskEngine = new RiskEngine(orderEngine, accountStream);
 accountStream.setRiskEngine(riskEngine);
+
+// Auto-reset sweeper: resets FAILED accounts 12h after the trader requests it (self-service).
+if (useDatabase) startResetSweeper(accountStream);
 
 // Contract codes (root → e.g. ESM6). Seed with a date-based approximation so the
 // endpoint is never empty; override with Databento-accurate codes when available.

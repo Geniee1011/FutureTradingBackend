@@ -24,6 +24,7 @@ import {
   listPositions,
   listTransactions,
   listViolations,
+  requestAccountReset,
 } from "../trading/repository.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 import type { OrderEngine, PlaceOrderInput } from "../trading/order-engine.js";
@@ -191,6 +192,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   }
   if (url.pathname === "/api/account" && req.method === "GET") {
     return handleAccount(req, res);
+  }
+  if (url.pathname === "/api/account/request-reset" && req.method === "POST") {
+    return handleRequestReset(req, res, opts.accountStream);
   }
   if (url.pathname === "/api/transactions" && req.method === "GET") {
     return handleTransactions(req, res);
@@ -641,6 +645,15 @@ async function handleTransactions(req: IncomingMessage, res: ServerResponse) {
   const accountId = await requireAccount(req);
   if (!accountId) return json(res, 401, { error: "unauthorized" });
   json(res, 200, await listTransactions(accountId));
+}
+
+async function handleRequestReset(req: IncomingMessage, res: ServerResponse, accountStream: AccountStream) {
+  const accountId = await requireAccount(req);
+  if (!accountId) return json(res, 401, { error: "unauthorized" });
+  const out = await requestAccountReset(accountId);
+  if (!out.ok) return json(res, 409, out);
+  await accountStream.refreshAccount(accountId).catch(() => {}); // push the requested state live
+  json(res, 200, out);
 }
 
 async function handleEquityCurve(req: IncomingMessage, res: ServerResponse) {
