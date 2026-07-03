@@ -38,6 +38,8 @@ import {
   adminListRuleTemplates,
   adminListTraders,
   adminListViolations,
+  adminListPendingReviews,
+  adminReviewDecision,
   adminAssignTier,
   adminResetAccount,
   adminSetAccountStatus,
@@ -213,6 +215,9 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
       open: await adminListOpenPositions((s) => opts.accountStream.getMarkPrice(s)),
       closed: await adminListClosedPositions(500),
     }));
+  if (url.pathname === "/api/admin/reviews" && req.method === "GET") return handleAdmin(req, res, adminListPendingReviews);
+  if (/^\/api\/admin\/reviews\/[^/]+$/.test(url.pathname) && req.method === "POST")
+    return handleAdminReviewDecision(url, req, res, opts.accountStream);
   if (url.pathname === "/api/admin/rules" && req.method === "GET") return handleAdmin(req, res, adminListRules);
   if (url.pathname === "/api/admin/rule-templates" && req.method === "GET") return handleAdmin(req, res, adminListRuleTemplates);
   if (/^\/api\/admin\/rule-templates\/[^/]+$/.test(url.pathname) && req.method === "POST")
@@ -410,6 +415,28 @@ async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: Ser
   } catch (err) {
     console.error(`[admin] account action ${action} failed:`, (err as Error).message);
     json(res, 500, { error: "action failed" });
+  }
+}
+
+async function handleAdminReviewDecision(url: URL, req: IncomingMessage, res: ServerResponse, accountStream: AccountStream) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  const accountId = url.pathname.split("/")[4]!; // /api/admin/reviews/:accountId
+  const body = await readJson<{ decision?: string }>(req);
+  const decision = body?.decision;
+  if (decision !== "approve" && decision !== "disapprove")
+    return json(res, 400, { error: "decision must be 'approve' or 'disapprove'" });
+  try {
+    const out = await adminReviewDecision(accountId, decision);
+    if (!out.ok) return json(res, out.error === "account not found" ? 404 : 409, out);
+    // Approve/disapprove both reset the account to a tier's starting state → reload the live
+    // cache and clear the trailing-drawdown peak so it recomputes from the fresh equity.
+    await accountStream.refreshAccount(accountId).catch(() => {});
+    accountStream.resetDrawdownPeak(accountId);
+    accountStream.publishAdminUpdate({ kind: `review_${decision}`, accountId });
+    json(res, 200, out);
+  } catch (err) {
+    console.error(`[admin] review ${decision} failed:`, (err as Error).message);
+    json(res, 500, { error: "review decision failed" });
   }
 }
 

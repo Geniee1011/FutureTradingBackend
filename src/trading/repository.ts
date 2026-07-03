@@ -235,11 +235,16 @@ export interface AccountSnapshot {
   statusReason: string | null; // why a non-ACTIVE account is in that state (the breach detail)
   dayStartEquity: number; // equity at the start of the current trading day
   highestEquity: number; // persisted all-time high-water mark (basis for trailing drawdown)
+  pendingReview: boolean; // reached profit target → awaiting admin Approve/Disapprove
+  tradingPaused: boolean; // hit the daily-loss limit TODAY → positions closed, orders blocked until tomorrow
+  tradingPausedReason: string | null; // the daily-limit breach detail
 }
 
 export async function getAccountSnapshot(accountId: string): Promise<AccountSnapshot | null> {
   const { rows } = await getPool().query(
-    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity","highestEquity" FROM "Account" WHERE "id" = $1`,
+    `SELECT "balance","startingBalance","dailyPnl","status","dayStartEquity","highestEquity","pendingReviewAt",
+            ("tradingPausedAt" = CURRENT_DATE) AS "tradingPausedToday"
+     FROM "Account" WHERE "id" = $1`,
     [accountId],
   );
   const r = rows[0];
@@ -254,6 +259,17 @@ export async function getAccountSnapshot(accountId: string): Promise<AccountSnap
     );
     statusReason = (v.rows[0]?.detail as string | undefined) ?? null;
   }
+  // A still-ACTIVE account can be paused for the day after hitting its daily-loss limit —
+  // positions were liquidated and new orders are blocked until tomorrow. Surface the reason.
+  const tradingPaused = r.status === "ACTIVE" && r.tradingPausedToday === true;
+  let tradingPausedReason: string | null = null;
+  if (tradingPaused) {
+    const v = await getPool().query(
+      `SELECT "detail" FROM "Violation" WHERE "accountId" = $1 AND "type" = 'DAILY_LOSS_EXCEEDED' ORDER BY "createdAt" DESC LIMIT 1`,
+      [accountId],
+    );
+    tradingPausedReason = (v.rows[0]?.detail as string | undefined) ?? null;
+  }
   return {
     balance: Number(r.balance),
     startingBalance: Number(r.startingBalance),
@@ -262,6 +278,9 @@ export async function getAccountSnapshot(accountId: string): Promise<AccountSnap
     statusReason,
     dayStartEquity: r.dayStartEquity != null ? Number(r.dayStartEquity) : Number(r.startingBalance),
     highestEquity: r.highestEquity != null ? Number(r.highestEquity) : Number(r.startingBalance),
+    pendingReview: r.pendingReviewAt != null,
+    tradingPaused,
+    tradingPausedReason,
   };
 }
 

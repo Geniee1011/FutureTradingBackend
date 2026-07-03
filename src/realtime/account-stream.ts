@@ -265,6 +265,9 @@ export class AccountStream {
         channel: "account-updates",
         status: acc.snapshot.status, // ACTIVE → PASSED/FAILED reflects live after a breach/target
         statusReason: acc.snapshot.statusReason, // the specific breach detail (null when ACTIVE)
+        pendingReview: acc.snapshot.pendingReview, // hit profit target → awaiting admin review (trader is congratulated)
+        tradingPaused: acc.snapshot.tradingPaused, // hit daily-loss limit today → positions closed, paused till tomorrow
+        tradingPausedReason: acc.snapshot.tradingPausedReason,
         balance: round(acc.snapshot.balance, 2),
         equity: round(equity, 2),
         unrealizedPnl: round(unrealized, 2),

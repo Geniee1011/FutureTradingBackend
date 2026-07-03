@@ -218,6 +218,14 @@ ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "tradingPausedAt" date;
 -- on auto-advance; Phase 2 PASSED goes to manual admin review for funded upgrade.
 ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "challengePhase" smallint NOT NULL DEFAULT 1;
 
+-- Manual-review gate: set to the moment an ACTIVE account first reaches its profit
+-- target (measured on REALIZED/closed P&L). The account keeps trading, but it now sits
+-- in the admin review queue awaiting Approve (advance to next phase/funded tier) or
+-- Disapprove (reset the current phase to retry). Cleared on either decision. NULL = not
+-- pending. The trader is shown a "congratulations, support will reach out" notification.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "pendingReviewAt" timestamptz;
+CREATE INDEX IF NOT EXISTS "Account_pendingReview_idx" ON "Account" ("pendingReviewAt") WHERE "pendingReviewAt" IS NOT NULL;
+
 -- EOD trailing drawdown state.
 -- peakIntradayEquity: highest equity (balance + unrealized) reached in the CURRENT
 --   session; resets each day. Used to snapshot the EOD peak at session close.

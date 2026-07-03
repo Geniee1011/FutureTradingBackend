@@ -1,5 +1,6 @@
 import { getPool } from "../db/pool.js";
 import { getMultiplier } from "../instruments.js";
+import { nextTierFor } from "./tiers.js";
 
 /* Admin/CRM reads + mutations over the real DB. Shapes mirror the frontend
    types (TradingApp/src/lib/types.ts). Fields the schema doesn't track
@@ -785,7 +786,7 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
               "dailyPnl" = 0, "totalPnl" = 0, "drawdown" = 0, "highestEquity" = "startingBalance",
               "dayStartEquity" = "startingBalance", "dayStartAt" = CURRENT_DATE,
               "peakIntradayEquity" = "startingBalance", "eodPeakEquity" = "startingBalance",
-              "tradingPausedAt" = NULL,
+              "tradingPausedAt" = NULL, "pendingReviewAt" = NULL,
               "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
       [accountId],
     );
@@ -806,7 +807,7 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
  * phase). Live state (positions, resting orders) is cleared like a reset; history is kept.
  * Returns false if the account or template doesn't exist.
  */
-export async function adminAssignTier(accountId: string, templateId: string): Promise<boolean> {
+export async function adminAssignTier(accountId: string, templateId: string, reason?: string): Promise<boolean> {
   const client = await getPool().connect();
   try {
     await client.query("BEGIN");
@@ -851,7 +852,7 @@ export async function adminAssignTier(accountId: string, templateId: string): Pr
          "drawdown" = 0, "highestEquity" = $3,
          "dayStartEquity" = $3, "dayStartAt" = CURRENT_DATE,
          "peakIntradayEquity" = $3, "eodPeakEquity" = $3,
-         "tradingPausedAt" = NULL, "challengePhase" = $4,
+         "tradingPausedAt" = NULL, "pendingReviewAt" = NULL, "challengePhase" = $4,
          "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now()
        WHERE "id" = $1`,
       [accountId, templateId, size, challengePhase],
@@ -883,7 +884,7 @@ export async function adminAssignTier(accountId: string, templateId: string): Pr
 
     await client.query(
       `INSERT INTO "ActivityLog" ("accountId","type","message") VALUES ($1,'ACCOUNT_PASSED',$2)`,
-      [accountId, `Account tier assigned: ${t.phase} — ${formatSize(size)}`],
+      [accountId, reason ?? `Account tier assigned: ${t.phase} — ${formatSize(size)}`],
     );
 
     await client.query("COMMIT");
@@ -894,6 +895,121 @@ export async function adminAssignTier(accountId: string, templateId: string): Pr
   } finally {
     client.release();
   }
+}
+
+// --------------------------- profit-target review queue ---------------------------
+
+export interface AdminPendingReview {
+  accountId: string;
+  traderId: string;
+  traderName: string;
+  email: string;
+  balance: number;
+  startingBalance: number;
+  realizedProfit: number; // balance − startingBalance (banked profit that hit the target)
+  profitTarget: number;
+  currentTier: string | null; // ruleTemplateId
+  currentTierLabel: string | null;
+  currentPhase: string | null; // e.g. 'Challenge Phase 1' | 'Funded'
+  nextTier: string | null; // templateId an Approve advances to (or 'f_1m' payout / null if untiered)
+  nextTierLabel: string | null;
+  decisionType: string; // human label for what Approve does
+  pendingReviewAt: number;
+}
+
+/** Accounts that hit their profit target and are awaiting an admin Approve/Disapprove. */
+export async function adminListPendingReviews(): Promise<AdminPendingReview[]> {
+  const { rows } = await getPool().query(
+    `SELECT a."id" AS "accountId", a."balance", a."startingBalance", a."ruleTemplateId", a."pendingReviewAt",
+            u."id" AS "traderId", u."name", u."email",
+            r."profitTarget",
+            rt."label" AS "currentTierLabel", rt."phase" AS "currentPhase"
+     FROM "Account" a
+     JOIN "User" u ON u."id" = a."userId"
+     LEFT JOIN "Rule" r ON r."accountId" = a."id"
+     LEFT JOIN "RuleTemplate" rt ON rt."id" = a."ruleTemplateId"
+     WHERE a."pendingReviewAt" IS NOT NULL
+     ORDER BY a."pendingReviewAt" ASC`,
+  );
+  const tpls = await getPool().query(`SELECT "id","label","phase" FROM "RuleTemplate"`);
+  const tplById = new Map(tpls.rows.map((t) => [t.id as string, t as { id: string; label: string; phase: string }]));
+  return rows.map((r) => {
+    const currentTier = (r.ruleTemplateId as string | null) ?? null;
+    const next = nextTierFor(currentTier) ?? (currentTier === "f_1m" ? "f_1m" : null);
+    const nextTpl = next ? tplById.get(next) : undefined;
+    let decisionType: string;
+    if (!next || !nextTpl) decisionType = "Pass (manual funding)";
+    else if (currentTier === "f_1m") decisionType = "Payout ($1M reset)";
+    else if (String(nextTpl.phase).startsWith("Challenge")) decisionType = "Next challenge phase";
+    else decisionType = "Funded account";
+    const balance = Number(r.balance);
+    const startingBalance = Number(r.startingBalance);
+    return {
+      accountId: r.accountId,
+      traderId: r.traderId,
+      traderName: r.name ?? r.email,
+      email: r.email,
+      balance,
+      startingBalance,
+      realizedProfit: Math.round((balance - startingBalance) * 100) / 100,
+      profitTarget: r.profitTarget != null ? Number(r.profitTarget) : 0,
+      currentTier,
+      currentTierLabel: (r.currentTierLabel as string | null) ?? null,
+      currentPhase: (r.currentPhase as string | null) ?? null,
+      nextTier: next,
+      nextTierLabel: nextTpl?.label ?? null,
+      decisionType,
+      pendingReviewAt: ms(r.pendingReviewAt),
+    };
+  });
+}
+
+/**
+ * Resolve a pending profit-target review.
+ *  - approve:   advance to the next tier (challenge phase → funded → funded scaling), or a
+ *               $1M payout reset at the top, or PASSED for an untiered account.
+ *  - disapprove: reset the CURRENT phase to a fresh start so the trader can retry.
+ * Both clear pendingReviewAt (adminAssignTier/adminResetAccount NULL it). Returns the outcome.
+ */
+export async function adminReviewDecision(
+  accountId: string,
+  decision: "approve" | "disapprove",
+): Promise<{ ok: boolean; error?: string; result?: string }> {
+  const { rows } = await getPool().query<{ ruleTemplateId: string | null; pendingReviewAt: Date | null }>(
+    `SELECT "ruleTemplateId","pendingReviewAt" FROM "Account" WHERE "id" = $1`,
+    [accountId],
+  );
+  const a = rows[0];
+  if (!a) return { ok: false, error: "account not found" };
+  if (a.pendingReviewAt == null) return { ok: false, error: "account is not pending review" };
+  const currentTier = a.ruleTemplateId;
+
+  if (decision === "disapprove") {
+    if (currentTier) await adminAssignTier(accountId, currentTier, "Review declined — phase reset to retry");
+    else await adminResetAccount(accountId);
+    return { ok: true, result: "reset" };
+  }
+
+  // approve
+  const next = nextTierFor(currentTier);
+  if (next) {
+    await adminAssignTier(accountId, next, `Review approved — advanced to ${next}`);
+    return { ok: true, result: `advanced:${next}` };
+  }
+  if (currentTier === "f_1m") {
+    await adminAssignTier(accountId, "f_1m", "Review approved — payout, $1M account reset");
+    return { ok: true, result: "payout" };
+  }
+  // Untiered/custom account with no successor → mark PASSED (funded; manual handling).
+  await getPool().query(
+    `UPDATE "Account" SET "status" = 'PASSED', "pendingReviewAt" = NULL, "updatedAt" = now() WHERE "id" = $1`,
+    [accountId],
+  );
+  await getPool().query(
+    `INSERT INTO "ActivityLog" ("accountId","type","message") VALUES ($1,'ACCOUNT_PASSED',$2)`,
+    [accountId, "Review approved — account passed"],
+  );
+  return { ok: true, result: "passed" };
 }
 
 /** Admin manual balance credit/debit. Records a ledger entry and bumps cash/equity. */
