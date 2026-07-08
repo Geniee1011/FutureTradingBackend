@@ -1,6 +1,7 @@
 import { getPool } from "../db/pool.js";
 import { getMultiplier } from "../instruments.js";
 import { nextTierFor } from "./tiers.js";
+import { bumpResetCount } from "./trader-stats.js";
 
 /* Admin/CRM reads + mutations over the real DB. Shapes mirror the frontend
    types (TradingApp/src/lib/types.ts). Fields the schema doesn't track
@@ -26,6 +27,7 @@ export interface AdminTrader {
   createdAt: number;
   accountSize: number | null; // assigned rule-tier size ($50K…$1M), null if unassigned
   accountPhase: string | null; // 'Challenge Phase 1' | 'Challenge Phase 2' | 'Funded'
+  riskPhase: number; // behavioural risk phase 1-4 (computed by the phase rules engine)
 }
 
 export interface AdminAccountRow {
@@ -100,7 +102,7 @@ const SEVERITY: Record<string, "info" | "warning" | "critical"> = {
 export async function adminListTraders(): Promise<AdminTrader[]> {
   const { rows } = await getPool().query(
     `SELECT u."id", u."name", u."email", u."status" AS "userStatus", u."createdAt",
-            a."id" AS "accountId", a."equity", a."totalPnl", a."drawdown", a."status" AS "accountStatus",
+            a."id" AS "accountId", a."equity", a."totalPnl", a."drawdown", a."status" AS "accountStatus", a."riskPhase",
             r."maxDrawdown", rt."accountSize", rt."phase" AS "accountPhase",
             (SELECT count(*)::int FROM "Position" p WHERE p."accountId" = a."id") AS "openPositions",
             (SELECT max(al."createdAt") FROM "ActivityLog" al WHERE al."accountId" = a."id") AS "lastActive"
@@ -131,6 +133,7 @@ export async function adminListTraders(): Promise<AdminTrader[]> {
       createdAt: ms(r.createdAt),
       accountSize: r.accountSize != null ? Number(r.accountSize) : null,
       accountPhase: (r.accountPhase as string | null) ?? null,
+      riskPhase: r.riskPhase != null ? Number(r.riskPhase) : 1,
     };
   });
 }
@@ -432,7 +435,7 @@ export async function adminGetTraderDetail(userId: string): Promise<AdminTraderD
     `SELECT u."id", u."name", u."email", u."status" AS "userStatus", u."createdAt",
             a."id" AS "accountId", a."startingBalance", a."balance", a."equity", a."dailyPnl",
             a."totalPnl", a."drawdown", a."highestEquity", a."status" AS "accountStatus",
-            a."ruleTemplateId", a."createdAt" AS "accountCreatedAt",
+            a."ruleTemplateId", a."riskPhase", a."createdAt" AS "accountCreatedAt",
             r."maxDailyLoss", r."maxDrawdown", r."profitTarget", r."maxContracts"
      FROM "User" u
      LEFT JOIN "Account" a ON a."userId" = u."id"
@@ -464,6 +467,7 @@ export async function adminGetTraderDetail(userId: string): Promise<AdminTraderD
     createdAt: ms(b.createdAt),
     accountSize: null, // detail view derives the tier from account.ruleTemplateId + templates
     accountPhase: null,
+    riskPhase: b.riskPhase != null ? Number(b.riskPhase) : 1,
   };
   const account: AdminTraderAccount | null = accountId
     ? {
@@ -790,6 +794,8 @@ export async function adminResetAccount(accountId: string): Promise<boolean> {
               "challengeStartedAt" = now(), "status" = 'ACTIVE', "updatedAt" = now() WHERE "id" = $1`,
       [accountId],
     );
+    // Analytics: count this challenge reset (reset_count is a lifetime counter).
+    await bumpResetCount(client, accountId);
     await client.query("COMMIT");
     return true;
   } catch (err) {

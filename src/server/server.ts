@@ -50,6 +50,9 @@ import {
   logActivity,
   type AdminAction,
 } from "../trading/admin-repository.js";
+import { analyticsOverall, analyticsTrader } from "../trading/analytics-repository.js";
+import { listPhaseRules, createPhaseRule, updatePhaseRule, deletePhaseRule } from "../trading/phase-rules.js";
+import { recomputeAllPhases } from "../trading/trader-stats.js";
 import { getPool } from "../db/pool.js";
 
 interface ServerOptions {
@@ -222,6 +225,18 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/admin/reviews" && req.method === "GET") return handleAdmin(req, res, adminListPendingReviews);
   if (/^\/api\/admin\/reviews\/[^/]+$/.test(url.pathname) && req.method === "POST")
     return handleAdminReviewDecision(url, req, res, opts.accountStream);
+  // Analytics (behavioural risk-phase dashboards).
+  if (url.pathname === "/api/admin/analytics/overall" && req.method === "GET") return handleAdmin(req, res, analyticsOverall);
+  if (/^\/api\/admin\/analytics\/trader\/[^/]+$/.test(url.pathname) && req.method === "GET")
+    return handleAdmin(req, res, () => analyticsTrader(url.pathname.split("/")[5]!));
+  // Phase rules CRUD (editable ruleset behind the phase engine).
+  if (url.pathname === "/api/admin/phase-rules" && req.method === "GET") return handleAdmin(req, res, listPhaseRules);
+  if (url.pathname === "/api/admin/phase-rules" && req.method === "POST")
+    return handleAdminPhaseRule(url, req, res, opts.accountStream, "create");
+  if (/^\/api\/admin\/phase-rules\/[^/]+$/.test(url.pathname) && (req.method === "PATCH" || req.method === "POST"))
+    return handleAdminPhaseRule(url, req, res, opts.accountStream, "update");
+  if (/^\/api\/admin\/phase-rules\/[^/]+$/.test(url.pathname) && req.method === "DELETE")
+    return handleAdminPhaseRule(url, req, res, opts.accountStream, "delete");
   if (url.pathname === "/api/admin/rules" && req.method === "GET") return handleAdmin(req, res, adminListRules);
   if (url.pathname === "/api/admin/rule-templates" && req.method === "GET") return handleAdmin(req, res, adminListRuleTemplates);
   if (/^\/api\/admin\/rule-templates\/[^/]+$/.test(url.pathname) && req.method === "POST")
@@ -419,6 +434,60 @@ async function handleAdminAccountAction(url: URL, req: IncomingMessage, res: Ser
   } catch (err) {
     console.error(`[admin] account action ${action} failed:`, (err as Error).message);
     json(res, 500, { error: "action failed" });
+  }
+}
+
+async function handleAdminPhaseRule(
+  url: URL,
+  req: IncomingMessage,
+  res: ServerResponse,
+  accountStream: AccountStream,
+  op: "create" | "update" | "delete",
+) {
+  if (!requireAdmin(req)) return json(res, 403, { error: "admin access required" });
+  try {
+    if (op === "create") {
+      const body = await readJson<Record<string, unknown>>(req);
+      const result = await createPhaseRule({
+        variable: String(body?.variable ?? ""),
+        operator: String(body?.operator ?? ""),
+        value: Number(body?.value),
+        assignsPhase: Number(body?.assignsPhase),
+        priority: body?.priority != null ? Number(body.priority) : undefined,
+        active: body?.active != null ? Boolean(body.active) : undefined,
+        notes: body?.notes != null ? String(body.notes) : null,
+      });
+      if ("error" in result) return json(res, 400, result);
+      await recomputeAllPhases();
+      accountStream.publishAdminUpdate({ kind: "phase_rules_changed" });
+      return json(res, 200, result);
+    }
+    const ruleId = Number(url.pathname.split("/")[4]);
+    if (!Number.isFinite(ruleId)) return json(res, 400, { error: "invalid rule id" });
+    if (op === "delete") {
+      const ok = await deletePhaseRule(ruleId);
+      if (ok) { await recomputeAllPhases(); accountStream.publishAdminUpdate({ kind: "phase_rules_changed" }); }
+      return json(res, ok ? 200 : 404, { ok });
+    }
+    // update (PATCH/POST): only the provided fields change.
+    const body = await readJson<Record<string, unknown>>(req);
+    const patch: Record<string, unknown> = {};
+    if (body?.variable != null) patch.variable = String(body.variable);
+    if (body?.operator != null) patch.operator = String(body.operator);
+    if (body?.value != null) patch.value = Number(body.value);
+    if (body?.assignsPhase != null) patch.assignsPhase = Number(body.assignsPhase);
+    if (body?.priority != null) patch.priority = Number(body.priority);
+    if (body?.active != null) patch.active = Boolean(body.active);
+    if (body?.notes !== undefined) patch.notes = body.notes == null ? null : String(body.notes);
+    const result = await updatePhaseRule(ruleId, patch);
+    if (result && "error" in result) return json(res, 400, result);
+    if (!result) return json(res, 404, { error: "rule not found or no fields to update" });
+    await recomputeAllPhases();
+    accountStream.publishAdminUpdate({ kind: "phase_rules_changed" });
+    return json(res, 200, result);
+  } catch (err) {
+    console.error("[admin] phase-rule op failed:", (err as Error).message);
+    return json(res, 500, { error: "phase-rule op failed" });
   }
 }
 

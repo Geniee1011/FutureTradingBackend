@@ -4,6 +4,7 @@ import { getPool } from "../db/pool.js";
 import { useDatabase } from "../config.js";
 import { getInstrument, getMultiplier, getMicroAlternative, miniEquivalent } from "../instruments.js";
 import { isMarketOpen, MARKET_CLOSED_MESSAGE } from "./market-hours.js";
+import { buildOpenSnapshot, markTradeOpened, recomputeAndPhase, resetSessionIfNeeded, type OpenSnapshot } from "./trader-stats.js";
 import type { AccountStream } from "../realtime/account-stream.js";
 
 /* ------------------------------------------------------------------ *
@@ -742,6 +743,11 @@ export class OrderEngine {
     // between the trader's chart and the admin per-trade panel.
     const round4 = (v: number) => Math.round(v * 1e4) / 1e4;
     const posSide: PosSide = side === "buy" ? "LONG" : "SHORT";
+    const now = new Date();
+    // Snapshot the trader's state for any OPENING lot this fill creates. It's stamped
+    // on the lot and later carried onto the ClosedPosition so analytics can group
+    // closed trades by the trader's state at the moment they opened the trade.
+    const snapshot = await buildOpenSnapshot(client, accountId, symbol, qty);
 
     if (!existing) {
       await client.query(
@@ -750,7 +756,8 @@ export class OrderEngine {
         [accountId, symbol, posSide, qty, round(fillPrice)],
       );
       // First lot of a brand-new position (admin CRM lists trades separately).
-      await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice));
+      await this.insertLot(client, accountId, symbol, side, qty, round(fillPrice), snapshot);
+      await markTradeOpened(client, accountId, symbol, qty, now);
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty} ${symbol} @ ${round(fillPrice)}`);
       return { realized: 0, side: posSide, qty };
     }
@@ -770,7 +777,8 @@ export class OrderEngine {
       );
       // A scale-in is a SEPARATE trade in the CRM — record its own lot (not merged
       // into the existing one), even though the netted Position line above averages them.
-      await this.insertLot(client, accountId, symbol, side, qty, lotPrice);
+      await this.insertLot(client, accountId, symbol, side, qty, lotPrice, snapshot);
+      await markTradeOpened(client, accountId, symbol, qty, now);
       return { realized: 0, side: existing.side, qty: newQty };
     }
 
@@ -815,14 +823,17 @@ export class OrderEngine {
         `UPDATE "Position" SET "side" = $2, "quantity" = $3, "averagePrice" = $4, "realizedPnl" = "realizedPnl" + $5, "updatedAt" = now() WHERE "id" = $1`,
         [existing.id, posSide, qty - existing.quantity, round(fillPrice), realized],
       );
-      await this.insertLot(client, accountId, symbol, side, qty - existing.quantity, round(fillPrice));
+      await this.insertLot(client, accountId, symbol, side, qty - existing.quantity, round(fillPrice), snapshot);
+      await markTradeOpened(client, accountId, symbol, qty, now);
       await this.log(client, accountId, "POSITION_CLOSED", `${existing.side.toLowerCase()} ${symbol} closed (realized ${realized})`);
       await this.log(client, accountId, "POSITION_OPENED", `${side === "buy" ? "long" : "short"} ${qty - existing.quantity} ${symbol} @ ${round(fillPrice)}`);
       return { realized, side: posSide, qty: qty - existing.quantity };
     }
   }
 
-  /** Record one open lot — a single entry trade — for the per-trade admin CRM view. */
+  /** Record one open lot — a single entry trade — for the per-trade admin CRM view.
+   *  Also stamps the analytics "at open" snapshot so it can be carried onto the
+   *  ClosedPosition when this lot is eventually closed. */
   private async insertLot(
     client: PoolClient,
     accountId: string,
@@ -830,10 +841,18 @@ export class OrderEngine {
     side: ApiSide,
     qty: number,
     entryPrice: number,
+    snapshot: OpenSnapshot,
   ): Promise<void> {
     await client.query(
-      `INSERT INTO "PositionLot" ("accountId","symbol","side","quantity","entryPrice") VALUES ($1,$2,$3,$4,$5)`,
-      [accountId, symbol, side === "buy" ? "LONG" : "SHORT", qty, entryPrice],
+      `INSERT INTO "PositionLot"
+         ("accountId","symbol","side","quantity","entryPrice",
+          "phaseAtOpen","scoreAtOpen","consecutiveLossesAtOpen","dailyLossPctAtOpen","sizeDeviationAtOpen")
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
+      [
+        accountId, symbol, side === "buy" ? "LONG" : "SHORT", qty, entryPrice,
+        snapshot.phaseAtOpen, snapshot.scoreAtOpen, snapshot.consecutiveLossesAtOpen,
+        snapshot.dailyLossPctAtOpen, snapshot.sizeDeviationAtOpen,
+      ],
     );
   }
 
@@ -868,8 +887,14 @@ export class OrderEngine {
       Math.round((fillPrice - entry) * q * dir * multiplier * 100) / 100;
     let remaining = closeQty;
     let total = 0;
-    const { rows } = await client.query<{ id: string; quantity: number; entryPrice: string; openedAt: Date }>(
-      `SELECT "id","quantity","entryPrice","openedAt" FROM "PositionLot"
+    const { rows } = await client.query<{
+      id: string; quantity: number; entryPrice: string; openedAt: Date;
+      phaseAtOpen: number | null; scoreAtOpen: string | null;
+      consecutiveLossesAtOpen: number | null; dailyLossPctAtOpen: string | null; sizeDeviationAtOpen: string | null;
+    }>(
+      `SELECT "id","quantity","entryPrice","openedAt",
+              "phaseAtOpen","scoreAtOpen","consecutiveLossesAtOpen","dailyLossPctAtOpen","sizeDeviationAtOpen"
+       FROM "PositionLot"
        WHERE "accountId" = $1 AND "symbol" = $2 ORDER BY "openedAt" ASC, "id" ASC`,
       [accountId, symbol],
     );
@@ -880,8 +905,16 @@ export class OrderEngine {
       const entry = Number(lot.entryPrice);
       const realized = realizedOf(entry, take);
       total += realized;
+      // Carry the lot's "at open" snapshot onto the closed-trade row for analytics.
+      const snap: OpenSnapshot | null = lot.phaseAtOpen == null ? null : {
+        phaseAtOpen: lot.phaseAtOpen,
+        scoreAtOpen: lot.scoreAtOpen == null ? null : Number(lot.scoreAtOpen),
+        consecutiveLossesAtOpen: lot.consecutiveLossesAtOpen ?? 0,
+        dailyLossPctAtOpen: lot.dailyLossPctAtOpen == null ? 0 : Number(lot.dailyLossPctAtOpen),
+        sizeDeviationAtOpen: lot.sizeDeviationAtOpen == null ? 0 : Number(lot.sizeDeviationAtOpen),
+      };
       // One closed-trade row per lot — its real entry price + open time, not the blend.
-      await this.recordClosedPosition(client, accountId, symbol, side, take, entry, fillPrice, realized, lot.openedAt);
+      await this.recordClosedPosition(client, accountId, symbol, side, take, entry, fillPrice, realized, lot.openedAt, snap);
       if (take >= lotQty) {
         await client.query(`DELETE FROM "PositionLot" WHERE "id" = $1`, [lot.id]);
       } else {
@@ -894,12 +927,13 @@ export class OrderEngine {
     if (remaining > 0) {
       const realized = realizedOf(fallbackEntry, remaining);
       total += realized;
-      await this.recordClosedPosition(client, accountId, symbol, side, remaining, fallbackEntry, fillPrice, realized, fallbackOpenedAt);
+      await this.recordClosedPosition(client, accountId, symbol, side, remaining, fallbackEntry, fillPrice, realized, fallbackOpenedAt, null);
     }
     return Math.round(total * 100) / 100;
   }
 
-  /** Append a closed-position record (one per realizing close/reduce/flip). */
+  /** Append a closed-position record (one per realizing close/reduce/flip), carrying
+   *  the originating lot's "at open" analytics snapshot when available. */
   private async recordClosedPosition(
     client: PoolClient,
     accountId: string,
@@ -910,12 +944,18 @@ export class OrderEngine {
     exitPrice: number,
     realizedPnl: number,
     openedAt: Date | undefined,
+    snapshot: OpenSnapshot | null,
   ): Promise<void> {
     await client.query(
       `INSERT INTO "ClosedPosition"
-         ("accountId","symbol","side","quantity","entryPrice","exitPrice","realizedPnl","openedAt")
-       VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, now()))`,
-      [accountId, symbol, side, quantity, entryPrice, exitPrice, realizedPnl, openedAt ?? null],
+         ("accountId","symbol","side","quantity","entryPrice","exitPrice","realizedPnl","openedAt",
+          "phaseAtOpen","scoreAtOpen","consecutiveLossesAtOpen","dailyLossPctAtOpen","sizeDeviationAtOpen")
+       VALUES ($1,$2,$3,$4,$5,$6,$7, COALESCE($8, now()), $9,$10,$11,$12,$13)`,
+      [
+        accountId, symbol, side, quantity, entryPrice, exitPrice, realizedPnl, openedAt ?? null,
+        snapshot?.phaseAtOpen ?? null, snapshot?.scoreAtOpen ?? null, snapshot?.consecutiveLossesAtOpen ?? null,
+        snapshot?.dailyLossPctAtOpen ?? null, snapshot?.sizeDeviationAtOpen ?? null,
+      ],
     );
   }
 
@@ -932,6 +972,9 @@ export class OrderEngine {
     minHoldTimeSecs = 0,
   ): Promise<PositionOutcome> {
     await client.query(`INSERT INTO "Fill" ("orderId","quantity","price") VALUES ($1,$2,$3)`, [orderId, qty, fillPrice]);
+    // Apply the 9:30 ET session reset (if the boundary passed) BEFORE the open snapshot
+    // reads session state, so a trade's dailyLossPctAtOpen reflects the new session.
+    await resetSessionIfNeeded(client, accountId, new Date());
     const outcome = await this.applyToPosition(client, accountId, symbol, side, qty, fillPrice, precision, minHoldTimeSecs);
     if (outcome.realized !== 0) {
       await client.query(
@@ -944,6 +987,9 @@ export class OrderEngine {
         [accountId, outcome.realized, `Realized P&L · ${symbol}`],
       );
     }
+    // Recompute lifetime/session/streak stats from history + re-assign the risk phase.
+    // Runs in the same transaction so the trade and its derived stats commit atomically.
+    await recomputeAndPhase(client, accountId, new Date());
     return outcome;
   }
 

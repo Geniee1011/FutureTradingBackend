@@ -312,3 +312,99 @@ ON CONFLICT ("id") DO UPDATE SET
 -- Link each Account to the tier whose rules it inherits.
 -- Set at account creation / upgrade; cascade propagates template edits to per-account Rule rows.
 ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "ruleTemplateId" text REFERENCES "RuleTemplate"("id");
+
+-- =====================================================================
+--  Analytics / behavioural risk-phase layer (added v3)
+-- =====================================================================
+
+-- The computed behavioural risk phase (1-4), distinct from "challengePhase"
+-- (the challenge STAGE). Recomputed by the phase rules engine on every trade
+-- event; displayed color-coded on the admin traders list. 1 = safest.
+ALTER TABLE "Account" ADD COLUMN IF NOT EXISTS "riskPhase" smallint NOT NULL DEFAULT 1;
+
+-- Per-trade "at open" snapshot. Captured on the OPEN lot, then carried onto the
+-- ClosedPosition when the lot closes, so the analytics page can group closed
+-- trades by the trader's state AT THE MOMENT THE TRADE WAS OPENED.
+--   phaseAtOpen           - riskPhase when this trade opened
+--   scoreAtOpen           - reserved (null for now; a future numeric score)
+--   consecutiveLossesAtOpen / dailyLossPctAtOpen / sizeDeviationAtOpen
+--                         - the three state vars the Overall charts bucket by
+ALTER TABLE "PositionLot"    ADD COLUMN IF NOT EXISTS "phaseAtOpen"             smallint;
+ALTER TABLE "PositionLot"    ADD COLUMN IF NOT EXISTS "scoreAtOpen"             numeric(10,2);
+ALTER TABLE "PositionLot"    ADD COLUMN IF NOT EXISTS "consecutiveLossesAtOpen" integer;
+ALTER TABLE "PositionLot"    ADD COLUMN IF NOT EXISTS "dailyLossPctAtOpen"      numeric(6,2);
+ALTER TABLE "PositionLot"    ADD COLUMN IF NOT EXISTS "sizeDeviationAtOpen"     numeric(10,4);
+ALTER TABLE "ClosedPosition" ADD COLUMN IF NOT EXISTS "phaseAtOpen"             smallint;
+ALTER TABLE "ClosedPosition" ADD COLUMN IF NOT EXISTS "scoreAtOpen"             numeric(10,2);
+ALTER TABLE "ClosedPosition" ADD COLUMN IF NOT EXISTS "consecutiveLossesAtOpen" integer;
+ALTER TABLE "ClosedPosition" ADD COLUMN IF NOT EXISTS "dailyLossPctAtOpen"      numeric(6,2);
+ALTER TABLE "ClosedPosition" ADD COLUMN IF NOT EXISTS "sizeDeviationAtOpen"     numeric(10,4);
+CREATE INDEX IF NOT EXISTS "ClosedPosition_phaseAtOpen_idx" ON "ClosedPosition" ("phaseAtOpen");
+
+-- Per-trader derived state (1:1 with Account). Kept out of "Account" so the
+-- once-per-second risk-engine equity writes don't churn these history-derived
+-- fields. Lifetime + avg-size fields recompute on each trade close; session
+-- fields reset at 9:30am ET (lazily, on the first event after the boundary).
+-- Win-rate fields are percentages 0-100. Per-instrument win rates roll micros
+-- into their parent (MES→ES, MNQ→NQ, MGC→GC, MCL→CL); YM is in totals only.
+CREATE TABLE IF NOT EXISTS "TraderStats" (
+  "accountId"          text PRIMARY KEY REFERENCES "Account"("id") ON DELETE CASCADE,
+  -- lifetime (recomputed on every trade close)
+  "lifetimeWinRate"    numeric(6,2)  NOT NULL DEFAULT 0,
+  "lifetimeWinRateEs"  numeric(6,2)  NOT NULL DEFAULT 0,
+  "lifetimeWinRateNq"  numeric(6,2)  NOT NULL DEFAULT 0,
+  "lifetimeWinRateGc"  numeric(6,2)  NOT NULL DEFAULT 0,
+  "lifetimeWinRateCl"  numeric(6,2)  NOT NULL DEFAULT 0,
+  "lifetimeAvgWin"     numeric(18,2) NOT NULL DEFAULT 0,
+  "lifetimeAvgLoss"    numeric(18,2) NOT NULL DEFAULT 0,
+  "lifetimeTradeCount" integer       NOT NULL DEFAULT 0,
+  "avgSize7dEs"        numeric(10,2) NOT NULL DEFAULT 0,
+  "avgSize7dNq"        numeric(10,2) NOT NULL DEFAULT 0,
+  "avgSize7dGc"        numeric(10,2) NOT NULL DEFAULT 0,
+  "avgSize7dCl"        numeric(10,2) NOT NULL DEFAULT 0,
+  "resetCount"         integer       NOT NULL DEFAULT 0,
+  -- session (reset at 9:30 ET)
+  "sessionStartedAt"   timestamptz,
+  "sessionPnl"         numeric(18,2) NOT NULL DEFAULT 0,
+  "sessionTradeCount"  integer       NOT NULL DEFAULT 0,
+  "sessionClosedCount" integer       NOT NULL DEFAULT 0,
+  "sessionWinCount"    integer       NOT NULL DEFAULT 0,
+  "consecutiveLosses"  integer       NOT NULL DEFAULT 0,
+  "consecutiveWins"    integer       NOT NULL DEFAULT 0,
+  "lastTradeResult"    text,
+  "lastTradeAt"        timestamptz,
+  "lastOpenSymbol"     text,
+  "lastOpenSize"       integer       NOT NULL DEFAULT 0,
+  "updatedAt"          timestamptz   NOT NULL DEFAULT now()
+);
+
+-- Editable phase ruleset. The engine reads ACTIVE rows ordered by priority
+-- (lower first), tests each against the trader's current variables, and assigns
+-- the HIGHEST matching phase (default 1 if none match). Editable from the admin
+-- Analytics page — no code deploy needed to change the rules.
+CREATE TABLE IF NOT EXISTS "PhaseRule" (
+  "ruleId"       serial PRIMARY KEY,
+  "variable"     text     NOT NULL,
+  "operator"     text     NOT NULL,           -- one of >=, <=, >, <, =
+  "value"        numeric(18,4) NOT NULL,
+  "assignsPhase" smallint NOT NULL,
+  "priority"     integer  NOT NULL DEFAULT 100,
+  "active"       boolean  NOT NULL DEFAULT true,
+  "notes"        text,
+  "createdAt"    timestamptz NOT NULL DEFAULT now(),
+  "updatedAt"    timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS "PhaseRule_active_priority_idx" ON "PhaseRule" ("active","priority");
+
+-- Pre-load the starting ruleset ONCE (only when the table is empty, so admin
+-- edits are never clobbered on redeploy).
+INSERT INTO "PhaseRule" ("variable","operator","value","assignsPhase","priority")
+SELECT v."variable", v."operator", v."value", v."assignsPhase", v."priority"
+FROM (VALUES
+  ('daily_loss_pct_consumed', '>=', 70, 4, 1),
+  ('session_trade_count',     '>',  8,  4, 1),
+  ('consecutive_losses',      '>=', 2,  3, 2),
+  ('daily_loss_pct_consumed', '>=', 40, 3, 2),
+  ('consecutive_losses',      '=',  1,  2, 3)
+) AS v("variable","operator","value","assignsPhase","priority")
+WHERE NOT EXISTS (SELECT 1 FROM "PhaseRule");
