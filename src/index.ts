@@ -4,6 +4,7 @@ import { createMarketServer } from "./server/server.js";
 import { SimulationProvider } from "./providers/simulation.js";
 import { DatabentoProvider } from "./providers/databento.js";
 import { DatabentoLiveProvider } from "./providers/databento-live.js";
+import { DxFeedProvider } from "./providers/dxfeed.js";
 import type { MarketDataProvider } from "./providers/provider.js";
 import { INSTRUMENTS, SYMBOLS } from "./instruments.js";
 import { computeContractCode } from "./contract-code.js";
@@ -31,6 +32,17 @@ function buildProvider(): MarketDataProvider {
     }
     console.log("[provider] Market-data model: BYO (Model B — per-user keys; charts via REST, execution simulated)");
     return new SimulationProvider();
+  }
+
+  // "dxfeed" — real-time via dxFeed dxLink. Behaves like the SHARED path (one feed
+  // fanned out to charts + used as marks), but sourced from dxFeed instead of
+  // Databento. Purely additive: the Databento branches below are unchanged.
+  if (config.marketDataMode === "dxfeed") {
+    console.log("[provider] Market-data model: dxFeed (dxLink WebSocket) —", config.dxfeed.endpoint);
+    if (!config.dxfeed.token) {
+      console.warn("[provider] MARKET_DATA_MODE=dxfeed with no DXFEED_TOKEN — OK for the public demo feed; set it for a production endpoint.");
+    }
+    return new DxFeedProvider(config.dxfeed.endpoint, config.dxfeed.token);
   }
 
   // Model A — "shared": one master key, fanned out to all users (current behaviour).

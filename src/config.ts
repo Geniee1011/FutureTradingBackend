@@ -18,9 +18,25 @@ export const config = {
    *    Simple, but counts as redistribution (needs a redistribution license).
    *  - "byo"    (Model B): each user brings their own Databento account; the app
    *    streams only data their own license covers (no redistribution).
+   *  - "dxfeed" : real-time via dxFeed's dxLink WebSocket feed (additive; leaves
+   *    the Databento paths untouched). Selected only when explicitly set.
    * Defaults to "shared" (current behaviour). See README "Market-data models".
    */
-  marketDataMode: (process.env.MARKET_DATA_MODE === "byo" ? "byo" : "shared") as "shared" | "byo",
+  marketDataMode: (
+    process.env.MARKET_DATA_MODE === "byo"
+      ? "byo"
+      : process.env.MARKET_DATA_MODE === "dxfeed"
+        ? "dxfeed"
+        : "shared"
+  ) as "shared" | "byo" | "dxfeed",
+
+  /** dxFeed (dxLink) real-time feed — used only when MARKET_DATA_MODE=dxfeed.
+   *  Defaults to the public demo endpoint so the wiring can be validated before
+   *  the operator drops in a production endpoint + token. */
+  dxfeed: {
+    endpoint: process.env.DXFEED_ENDPOINT?.trim() || "wss://demo.dxfeed.com/market-data/dxlink-ws",
+    token: process.env.DXFEED_TOKEN?.trim() ?? "",
+  },
 
   jwt: {
     secret: process.env.JWT_SECRET?.trim() || "dev-insecure-secret-change-me",
