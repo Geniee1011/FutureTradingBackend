@@ -70,3 +70,8 @@ export function sessionAnchor(now: Date = new Date()): Date {
 export function minutesInSession(now: Date = new Date()): number {
   return Math.max(0, Math.floor((now.getTime() - sessionAnchor(now).getTime()) / 60_000));
 }
+
+/** Eastern-Time calendar day key (YYYY-MM-DD) — used to bucket trades by trading day. */
+export function etDateKey(d: Date): string {
+  return new Intl.DateTimeFormat("en-CA", { timeZone: ET, year: "numeric", month: "2-digit", day: "2-digit" }).format(d);
+}
