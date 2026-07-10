@@ -129,44 +129,47 @@ async function reconstructTrades(accountIds?: string[]): Promise<ReconTrade[]> {
 
 // --- Overall ------------------------------------------------------
 
-export interface Bucketed { label: string; n: number; winRate: number; }
+/** One bucket of trades carrying BOTH metrics, so every dimension can render an
+ *  Average-P&L chart and a Win-rate chart. */
+export interface Bucketed { label: string; n: number; winRate: number; avgPnl: number; }
 
 export interface OverallAnalytics {
-  avgPnlByPhase: { phase: number; avgPnl: number; n: number }[];
-  winRateByConsecutiveLosses: Bucketed[];
-  winRateByDailyLoss: Bucketed[];
-  winRateBySizeDeviation: Bucketed[];
+  byPhase: Bucketed[];
+  byConsecutiveLosses: Bucketed[];
+  byDailyLoss: Bucketed[];
+  bySizeDeviation: Bucketed[];
   lifetimeWinRateHistogram: { label: string; n: number }[];
   mostTradedInstruments: { symbol: string; n: number }[];
   shadowPnlCurve: { day: string; value: number }[];
   totalClosedTrades: number;
 }
 
-function winBuckets(trades: ReconTrade[], keyFn: (t: ReconTrade) => number, labels: string[]): Bucketed[] {
-  const acc = labels.map(() => ({ n: 0, wins: 0 }));
+/** Bucket trades by keyFn, returning count + win rate + average P&L per bucket. */
+function bucketStats(trades: ReconTrade[], keyFn: (t: ReconTrade) => number, labels: string[]): Bucketed[] {
+  const acc = labels.map(() => ({ n: 0, wins: 0, sum: 0 }));
   for (const t of trades) {
     const i = keyFn(t);
     if (i < 0 || i >= labels.length) continue;
     acc[i]!.n++;
+    acc[i]!.sum += t.realizedPnl;
     if (t.win) acc[i]!.wins++;
   }
-  return labels.map((label, i) => ({ label, n: acc[i]!.n, winRate: acc[i]!.n ? round2((acc[i]!.wins / acc[i]!.n) * 100) : 0 }));
+  return labels.map((label, i) => ({
+    label,
+    n: acc[i]!.n,
+    winRate: acc[i]!.n ? round2((acc[i]!.wins / acc[i]!.n) * 100) : 0,
+    avgPnl: acc[i]!.n ? round2(acc[i]!.sum / acc[i]!.n) : 0,
+  }));
 }
 
 export async function analyticsOverall(): Promise<OverallAnalytics> {
   const recon = await reconstructTrades();
 
-  // Avg P&L by (reconstructed) phase.
-  const byPhase = new Map<number, { sum: number; n: number }>();
-  for (const t of recon) {
-    const e = byPhase.get(t.phase) ?? { sum: 0, n: 0 };
-    e.sum += t.realizedPnl; e.n++;
-    byPhase.set(t.phase, e);
-  }
-  const avgPnlByPhase = [1, 2, 3, 4].map((phase) => {
-    const e = byPhase.get(phase);
-    return { phase, avgPnl: e && e.n ? round2(e.sum / e.n) : 0, n: e?.n ?? 0 };
-  });
+  // Every dimension carries both avg P&L and win rate (4 dims → 8 charts on the page).
+  const byPhase = bucketStats(recon, (t) => t.phase - 1, ["P1", "P2", "P3", "P4"]);
+  const byConsecutiveLosses = bucketStats(recon, (t) => Math.min(t.consecLossesBefore, 4), ["0", "1", "2", "3", "4+"]);
+  const byDailyLoss = bucketStats(recon, (t) => (t.dailyLossPct < 20 ? 0 : t.dailyLossPct < 40 ? 1 : t.dailyLossPct < 70 ? 2 : 3), ["0-20%", "20-40%", "40-70%", "70%+"]);
+  const bySizeDeviation = bucketStats(recon, (t) => (t.sizeDev < 1 ? 0 : t.sizeDev < 1.5 ? 1 : t.sizeDev < 2.5 ? 2 : 3), ["<1x", "1-1.5x", "1.5-2.5x", ">2.5x"]);
 
   // Lifetime win-rate distribution across all traders (from full history).
   const byAcct = new Map<string, { n: number; wins: number }>();
@@ -197,10 +200,10 @@ export async function analyticsOverall(): Promise<OverallAnalytics> {
   const shadowPnlCurve = [...byDay.keys()].sort().map((day) => { cum += byDay.get(day)!; return { day, value: round2(cum) }; });
 
   return {
-    avgPnlByPhase,
-    winRateByConsecutiveLosses: winBuckets(recon, (t) => Math.min(t.consecLossesBefore, 4), ["0", "1", "2", "3", "4+"]),
-    winRateByDailyLoss: winBuckets(recon, (t) => (t.dailyLossPct < 20 ? 0 : t.dailyLossPct < 40 ? 1 : t.dailyLossPct < 70 ? 2 : 3), ["0-20%", "20-40%", "40-70%", "70%+"]),
-    winRateBySizeDeviation: winBuckets(recon, (t) => (t.sizeDev < 1 ? 0 : t.sizeDev < 1.5 ? 1 : t.sizeDev < 2.5 ? 2 : 3), ["<1x", "1-1.5x", "1.5-2.5x", ">2.5x"]),
+    byPhase,
+    byConsecutiveLosses,
+    byDailyLoss,
+    bySizeDeviation,
     lifetimeWinRateHistogram,
     mostTradedInstruments,
     shadowPnlCurve,
