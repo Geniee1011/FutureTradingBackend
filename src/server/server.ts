@@ -53,6 +53,7 @@ import {
 import { analyticsOverall, analyticsTrader } from "../trading/analytics-repository.js";
 import { listPhaseRules, createPhaseRule, updatePhaseRule, deletePhaseRule } from "../trading/phase-rules.js";
 import { recomputeAllPhases } from "../trading/trader-stats.js";
+import type { MarketDataProvider } from "../providers/provider.js";
 import { getPool } from "../db/pool.js";
 
 interface ServerOptions {
@@ -62,6 +63,10 @@ interface ServerOptions {
   auth: AuthService;
   accountStream: AccountStream;
   orderEngine: OrderEngine;
+  /** Provider that serves candles via the OPERATOR (house) key — used by the signal
+   *  app's chart (its users have no per-user key). In BYO mode this is the house feed;
+   *  in shared mode it's the main provider. */
+  houseProvider: MarketDataProvider;
   /** Mutable root→contract-code map (filled in asynchronously after startup). */
   contractCodes: Record<string, string>;
 }
@@ -284,6 +289,11 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/market-data/quote" && req.method === "GET") {
     return handleByoQuote(url, req, res);
   }
+  // Operator-key candle history for the signal app's chart (its users have no
+  // per-user Databento key). Guarded by an optional shared SERVICE_TOKEN.
+  if (url.pathname === "/api/market/history" && req.method === "GET") {
+    return handleMarketHistory(url, req, res, opts.houseProvider);
+  }
 
   json(res, 404, { error: "not found" });
 }
@@ -307,6 +317,31 @@ async function handleHistory(url: URL, res: ServerResponse, hub: MarketHub) {
     json(res, 200, candles);
   } catch (err) {
     console.error("[history] error:", (err as Error).message);
+    json(res, 502, { error: "history fetch failed" });
+  }
+}
+
+/**
+ * Candle history via the operator (house) Databento key — for the signal app's
+ * chart. Optionally gated by SERVICE_TOKEN: if set, callers must send a matching
+ * `x-service-token` header (the signal backend does); if unset (dev), it's open.
+ * NOTE: serving this data to signal subscribers is a redistribution of Databento
+ * data — ensure the operator key's licence covers that.
+ */
+async function handleMarketHistory(url: URL, req: IncomingMessage, res: ServerResponse, provider: MarketDataProvider) {
+  const required = process.env.SERVICE_TOKEN?.trim();
+  if (required && req.headers["x-service-token"] !== required) {
+    return json(res, 403, { error: "service token required" });
+  }
+  const symbol = url.searchParams.get("symbol");
+  const resolution = Number(url.searchParams.get("resolution") ?? "300");
+  const count = Math.min(Number(url.searchParams.get("count") ?? "300"), 5000);
+  if (!symbol || !SYMBOLS.includes(symbol)) return json(res, 400, { error: "invalid or missing symbol" });
+  if (!Number.isFinite(resolution) || resolution <= 0) return json(res, 400, { error: "invalid resolution" });
+  try {
+    json(res, 200, await provider.getHistory(symbol, resolution, count));
+  } catch (err) {
+    console.error("[market-history] error:", (err as Error).message);
     json(res, 502, { error: "history fetch failed" });
   }
 }

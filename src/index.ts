@@ -139,6 +139,9 @@ const server = createMarketServer(hub, {
   auth,
   accountStream,
   orderEngine,
+  // Candles for the signal app's chart come from the operator key: the house feed
+  // (BYO mode) or the main provider (shared mode). Never a per-user key.
+  houseProvider: houseFeed ?? provider,
   contractCodes,
 });
 

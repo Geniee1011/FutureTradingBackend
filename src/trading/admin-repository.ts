@@ -255,6 +255,7 @@ export interface AdminOpenPosition {
   // Derived fresh per query, so a later add/edit by the trader shows on the next refresh.
   stopLoss: number | null;
   takeProfit: number | null;
+  conviction: number; // risk phase (1-4) the trade opened in
 }
 
 export interface AdminClosedPosition {
@@ -270,6 +271,7 @@ export interface AdminClosedPosition {
   realizedPnl: number;
   openedAt: number;
   closedAt: number;
+  conviction: number; // risk phase (1-4) the trade opened in
 }
 
 /** Every OPEN position across all accounts (admin-wide Positions view). */
@@ -289,6 +291,7 @@ export async function adminListOpenPositions(
   // entry price + open time; the protective bracket is per-symbol (shared by the lots).
   const { rows } = await getPool().query(
     `SELECT l."id", l."symbol", l."side", l."quantity", l."entryPrice", l."openedAt", l."accountId",
+            l."phaseAtOpen", a."riskPhase",
             u."id" AS "traderId", u."name", u."email",
             p."quantity" AS "posQty", p."realizedPnl" AS "posRealized",
             -- Per-symbol protective bracket = the open OCO exit legs (SL=STOP, TP=LIMIT).
@@ -335,6 +338,8 @@ export async function adminListOpenPositions(
       openedAt: ms(r.openedAt),
       stopLoss: r.stopLoss != null ? Number(r.stopLoss) : null,
       takeProfit: r.takeProfit != null ? Number(r.takeProfit) : null,
+      // Per-trade phase when it opened; fall back to the account's current phase, then 1.
+      conviction: r.phaseAtOpen != null ? Number(r.phaseAtOpen) : r.riskPhase != null ? Number(r.riskPhase) : 1,
     };
   });
 }
@@ -343,7 +348,7 @@ export async function adminListOpenPositions(
 export async function adminListClosedPositions(limit = 500): Promise<AdminClosedPosition[]> {
   const { rows } = await getPool().query(
     `SELECT c."id", c."symbol", c."side", c."quantity", c."entryPrice", c."exitPrice",
-            c."realizedPnl", c."openedAt", c."closedAt", c."accountId",
+            c."realizedPnl", c."openedAt", c."closedAt", c."accountId", c."phaseAtOpen",
             u."id" AS "traderId", u."name", u."email"
      FROM "ClosedPosition" c
      JOIN "Account" a ON a."id" = c."accountId"
@@ -365,6 +370,7 @@ export async function adminListClosedPositions(limit = 500): Promise<AdminClosed
     realizedPnl: Number(r.realizedPnl),
     openedAt: ms(r.openedAt),
     closedAt: ms(r.closedAt),
+    conviction: r.phaseAtOpen != null ? Number(r.phaseAtOpen) : 1,
   }));
 }
 
