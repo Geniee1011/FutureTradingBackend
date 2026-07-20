@@ -294,6 +294,12 @@ function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, o
   if (url.pathname === "/api/market/history" && req.method === "GET") {
     return handleMarketHistory(url, req, res, opts.houseProvider);
   }
+  // Live mark prices for the signal app, straight from the same in-memory quote
+  // map the admin Positions page marks against — so a counter-signal's P&L is the
+  // exact negation of what the admin sees, not a candle-derived approximation.
+  if (url.pathname === "/api/market/marks" && req.method === "GET") {
+    return handleMarketMarks(url, req, res, opts.accountStream);
+  }
 
   json(res, 404, { error: "not found" });
 }
@@ -344,6 +350,30 @@ async function handleMarketHistory(url: URL, req: IncomingMessage, res: ServerRe
     console.error("[market-history] error:", (err as Error).message);
     json(res, 502, { error: "history fetch failed" });
   }
+}
+
+/**
+ * Live marks for the signal app: `{ "ES": 7496.5, ... }`.
+ *
+ * Reads the SAME `accountStream` quote map that `/api/admin/positions` marks open
+ * lots against, so the two stay in lockstep. Symbols with no quote yet are simply
+ * omitted — the caller must not treat a missing mark as a price of 0.
+ * Guarded by the same optional shared SERVICE_TOKEN as /api/market/history.
+ */
+function handleMarketMarks(url: URL, req: IncomingMessage, res: ServerResponse, accountStream: AccountStream) {
+  const required = process.env.SERVICE_TOKEN?.trim();
+  if (required && req.headers["x-service-token"] !== required) {
+    return json(res, 403, { error: "service token required" });
+  }
+  const raw = (url.searchParams.get("symbols") ?? "").trim();
+  const requested = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : SYMBOLS;
+  const out: Record<string, number> = {};
+  for (const symbol of requested) {
+    if (!SYMBOLS.includes(symbol)) continue;
+    const price = accountStream.getMarkPrice(symbol);
+    if (price != null && price > 0) out[symbol] = price;
+  }
+  json(res, 200, out);
 }
 
 async function handleLogin(req: IncomingMessage, res: ServerResponse, auth: AuthService) {
