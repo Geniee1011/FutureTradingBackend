@@ -1,7 +1,7 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import type { MarketHub } from "../core/hub.js";
-import { INSTRUMENTS, SYMBOLS } from "../instruments.js";
+import { INSTRUMENTS, SYMBOLS, getMultiplier } from "../instruments.js";
 import type { AuthService } from "../auth/service.js";
 import { bearerToken, verifyToken } from "../auth/jwt.js";
 import { config, useDatabase } from "../config.js";
@@ -367,11 +367,14 @@ function handleMarketMarks(url: URL, req: IncomingMessage, res: ServerResponse, 
   }
   const raw = (url.searchParams.get("symbols") ?? "").trim();
   const requested = raw ? raw.split(",").map((s) => s.trim()).filter(Boolean) : SYMBOLS;
-  const out: Record<string, number> = {};
+  // The contract multiplier ships WITH the mark so the signal backend never has to
+  // keep its own copy of the instrument table. A multiplier that drifted out of sync
+  // would silently mis-scale every counter-signal's P&L with nothing to flag it.
+  const out: Record<string, { mark: number; multiplier: number }> = {};
   for (const symbol of requested) {
     if (!SYMBOLS.includes(symbol)) continue;
     const price = accountStream.getMarkPrice(symbol);
-    if (price != null && price > 0) out[symbol] = price;
+    if (price != null && price > 0) out[symbol] = { mark: price, multiplier: getMultiplier(symbol) };
   }
   json(res, 200, out);
 }
