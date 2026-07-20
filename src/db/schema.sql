@@ -408,3 +408,15 @@ FROM (VALUES
   ('consecutive_losses',      '=',  1,  2, 3)
 ) AS v("variable","operator","value","assignsPhase","priority")
 WHERE NOT EXISTS (SELECT 1 FROM "PhaseRule");
+
+-- Live mark prices, published by the account stream for OTHER services that share
+-- this database (the signal app marks its counter-signals against these). The
+-- trading backend itself always uses its in-memory quote map; this table exists
+-- purely so a separate process can read the SAME price without an HTTP hop and
+-- without needing its own market-data key. One row per symbol, upserted ~1s.
+CREATE TABLE IF NOT EXISTS "MarketMark" (
+  "symbol"     text PRIMARY KEY,
+  "price"      numeric(18,6) NOT NULL,
+  "multiplier" numeric(12,4) NOT NULL DEFAULT 1,
+  "updatedAt"  timestamptz   NOT NULL DEFAULT now()
+);
