@@ -1,5 +1,6 @@
 import WebSocket from "ws";
-import { BaseProvider, round, synthBook, aggregateCandles } from "./provider.js";
+import { BaseProvider, round, synthBook } from "./provider.js";
+import { aggregateCandles } from "./databento-shared.js";
 import { INSTRUMENTS, getInstrument } from "../instruments.js";
 import type { Candle } from "../types.js";
 
@@ -87,12 +88,8 @@ export class DxFeedProvider extends BaseProvider {
 
   private readonly state = new Map<string, SymState>();
   private readonly toDx = new Map<string, string>(); // internal → dxFeed symbol
-  /* dxFeed symbol → internal symbols. ONE-TO-MANY on purpose: several of our
-   * instruments can legitimately share a feed symbol, because a micro contract
-   * quotes the same price as its full-size sibling (MES prints the same index
-   * level as ES; only the multiplier differs). A 1:1 map silently dropped every
-   * instrument but the last one written, which looked like a dead feed for ES
-   * while MES worked. */
+  // dxFeed symbol → internal symbols. Not 1:1: a micro shares its full-size sibling's
+  // dxFeed symbol (e.g. ES & MES both → /ES:XCME), so one dx symbol can map to several.
   private readonly fromDx = new Map<string, string[]>();
   private readonly channelOpen = new Map<number, boolean>();
   private readonly bookEmitAt = new Map<string, number>();
@@ -134,8 +131,8 @@ export class DxFeedProvider extends BaseProvider {
       const dx = override[inst.symbol] ?? base[inst.symbol];
       if (!dx) continue;
       this.toDx.set(inst.symbol, dx);
-      const sharing = this.fromDx.get(dx);
-      if (sharing) sharing.push(inst.symbol);
+      const shared = this.fromDx.get(dx);
+      if (shared) shared.push(inst.symbol);
       else this.fromDx.set(dx, [inst.symbol]);
       this.state.set(inst.symbol, {
         price: inst.simBase, bid: 0, ask: 0, dayOpen: 0, prevClose: 0,
@@ -300,7 +297,9 @@ export class DxFeedProvider extends BaseProvider {
         this.onCandle(e);
         continue;
       }
-      for (const symbol of this.fromDx.get(String(e.eventSymbol)) ?? []) {
+      const symbols = this.fromDx.get(String(e.eventSymbol));
+      if (!symbols) continue;
+      for (const symbol of symbols) {
         const st = this.state.get(symbol);
         if (!st) continue;
         switch (e.eventType) {
