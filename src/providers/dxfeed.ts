@@ -1,5 +1,5 @@
 import WebSocket from "ws";
-import { BaseProvider, round, synthBook } from "./provider.js";
+import { BaseProvider, round, synthBook, aggregateCandles } from "./provider.js";
 import { INSTRUMENTS, getInstrument } from "../instruments.js";
 import type { Candle } from "../types.js";
 
@@ -87,7 +87,13 @@ export class DxFeedProvider extends BaseProvider {
 
   private readonly state = new Map<string, SymState>();
   private readonly toDx = new Map<string, string>(); // internal → dxFeed symbol
-  private readonly fromDx = new Map<string, string>(); // dxFeed symbol → internal
+  /* dxFeed symbol → internal symbols. ONE-TO-MANY on purpose: several of our
+   * instruments can legitimately share a feed symbol, because a micro contract
+   * quotes the same price as its full-size sibling (MES prints the same index
+   * level as ES; only the multiplier differs). A 1:1 map silently dropped every
+   * instrument but the last one written, which looked like a dead feed for ES
+   * while MES worked. */
+  private readonly fromDx = new Map<string, string[]>();
   private readonly channelOpen = new Map<number, boolean>();
   private readonly bookEmitAt = new Map<string, number>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
@@ -128,7 +134,9 @@ export class DxFeedProvider extends BaseProvider {
       const dx = override[inst.symbol] ?? base[inst.symbol];
       if (!dx) continue;
       this.toDx.set(inst.symbol, dx);
-      this.fromDx.set(dx, inst.symbol);
+      const sharing = this.fromDx.get(dx);
+      if (sharing) sharing.push(inst.symbol);
+      else this.fromDx.set(dx, [inst.symbol]);
       this.state.set(inst.symbol, {
         price: inst.simBase, bid: 0, ask: 0, dayOpen: 0, prevClose: 0,
         high: 0, low: 0, volume: 0, havePrice: false,
@@ -292,20 +300,20 @@ export class DxFeedProvider extends BaseProvider {
         this.onCandle(e);
         continue;
       }
-      const symbol = this.fromDx.get(String(e.eventSymbol));
-      if (!symbol) continue;
-      const st = this.state.get(symbol);
-      if (!st) continue;
-      switch (e.eventType) {
-        case "Trade":
-          this.onTrade(symbol, st, e);
-          break;
-        case "Quote":
-          this.onQuote(symbol, st, e);
-          break;
-        case "Summary":
-          this.onSummary(symbol, st, e);
-          break;
+      for (const symbol of this.fromDx.get(String(e.eventSymbol)) ?? []) {
+        const st = this.state.get(symbol);
+        if (!st) continue;
+        switch (e.eventType) {
+          case "Trade":
+            this.onTrade(symbol, st, e);
+            break;
+          case "Quote":
+            this.onQuote(symbol, st, e);
+            break;
+          case "Summary":
+            this.onSummary(symbol, st, e);
+            break;
+        }
       }
     }
   }
@@ -439,7 +447,7 @@ export class DxFeedProvider extends BaseProvider {
     // The buffer is minute-grained, so it cannot build sub-minute resolutions.
     if (resolutionSec < 60 || !live || live.length === 0) return snapshot.slice(-count);
     const lastSnapshot = snapshot.length ? snapshot[snapshot.length - 1]!.time : 0;
-    const tail = aggregate(live, resolutionSec).filter((c) => c.time > lastSnapshot);
+    const tail = aggregateCandles(live, resolutionSec).filter((c) => c.time > lastSnapshot);
     return (tail.length ? [...snapshot, ...tail] : snapshot).slice(-count);
   }
 
