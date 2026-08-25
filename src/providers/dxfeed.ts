@@ -32,6 +32,7 @@ const HISTORY_MAX_MS = 8_000;
 
 const CHANNEL_FEED = 1; // live Quote/Trade/Summary
 const CHANNEL_HIST = 3; // on-demand Candle snapshots
+const LIVE_BAR_CAP = 1500; // ~25h of live-built 1-minute bars per symbol
 
 /**
  * Internal symbol → dxFeed symbol. Kept LOCAL to this provider so instruments.ts
@@ -91,13 +92,29 @@ export class DxFeedProvider extends BaseProvider {
   private readonly bookEmitAt = new Map<string, number>();
   // In-flight candle-history requests, keyed by the dxFeed candle symbol ("/ES:XCME{=1m}").
   private readonly hist = new Map<string, HistPending>();
+  /* Live-built 1-minute bars per symbol, oldest first.
+   *
+   * Candle history is a SEPARATE dxFeed entitlement from streaming quotes, and an
+   * endpoint can have one without the other — the public demo host serves live
+   * futures quotes but returns no Candle events at all, which leaves getHistory()
+   * with nothing to return and the chart blank. Aggregating the trade prints we are
+   * already receiving gives a real chart that starts shallow and deepens as it runs.
+   * Same approach DatabentoLiveProvider uses to bridge its publication lag. */
+  private readonly liveBars = new Map<string, Candle[]>();
 
   constructor(
     private readonly endpoint: string,
     private readonly token: string,
   ) {
     super();
-    const isDemo = process.env.DXFEED_DEMO === "1" || /demo\.dxfeed\.com/i.test(endpoint);
+    /* The demo host DOES serve real CME futures (verified 2026-08-24: /ES:XCME,
+     * /CL:XNYM, /6E:XCME all quote live; the rest are silent). So the ETF stand-in
+     * swap is no longer automatic — `DXFEED_DEMO=0` opts out explicitly.
+     * This matters: the stand-ins are only safe if EVERY instrument uses them. A
+     * partial swap would quote YM at DIA's ~450 instead of ~44,000, and a wrong
+     * price is far worse than no price — it marks positions and trips risk rules. */
+    const isDemo = process.env.DXFEED_DEMO === "1"
+      || (process.env.DXFEED_DEMO !== "0" && /demo\.dxfeed\.com/i.test(endpoint));
     let override: Record<string, string> = {};
     if (process.env.DXFEED_SYMBOL_MAP) {
       try {
@@ -303,7 +320,28 @@ export class DxFeedProvider extends BaseProvider {
     if (st.high) st.high = Math.max(st.high, price);
     if (st.low) st.low = Math.min(st.low, price);
     if (first) console.log(`[dxfeed] first trade ${symbol} @ ${price}`);
+    this.recordLiveBar(symbol, price, num(e.size));
     this.emitQuote(symbol, st, num(e.size));
+  }
+
+  /** Fold one trade print into the current minute's bar for `symbol`. */
+  private recordLiveBar(symbol: string, price: number, size: number): void {
+    const minute = Math.floor(Date.now() / 60_000) * 60; // bar time, seconds
+    let bars = this.liveBars.get(symbol);
+    if (!bars) { bars = []; this.liveBars.set(symbol, bars); }
+    const open = bars[bars.length - 1];
+    if (open && open.time === minute) {
+      open.high = Math.max(open.high, price);
+      open.low = Math.min(open.low, price);
+      open.close = price;
+      open.volume = (open.volume ?? 0) + (Number.isFinite(size) ? size : 0);
+      return;
+    }
+    // Out-of-order print for a minute we already closed: drop it rather than
+    // append, which would put the series out of order and break the chart.
+    if (open && open.time > minute) return;
+    bars.push({ time: minute, open: price, high: price, low: price, close: price, volume: Number.isFinite(size) ? size : 0 });
+    if (bars.length > LIVE_BAR_CAP) bars.splice(0, bars.length - LIVE_BAR_CAP);
   }
 
   private onQuote(symbol: string, st: SymState, e: Record<string, unknown>): void {
@@ -362,7 +400,16 @@ export class DxFeedProvider extends BaseProvider {
   async getHistory(symbol: string, resolutionSec: number, count: number): Promise<Candle[]> {
     const inst = getInstrument(symbol);
     const dx = this.toDx.get(symbol);
-    if (!inst || !dx || !this.channelOpen.get(CHANNEL_HIST)) return [];
+    if (!inst || !dx) return [];
+    const snapshot = this.channelOpen.get(CHANNEL_HIST)
+      ? await this.candleSnapshot(dx, inst.pricePrecision, resolutionSec, count)
+      : [];
+    return this.mergeLiveBars(symbol, snapshot, resolutionSec, count);
+  }
+
+  /** Ask dxFeed for a Candle snapshot. Empty when the endpoint has no candle
+   *  entitlement (the public demo host), which is why mergeLiveBars exists. */
+  private candleSnapshot(dx: string, precision: number, resolutionSec: number, count: number): Promise<Candle[]> {
     const candleSymbol = `${dx}{=${candlePeriod(resolutionSec)}}`;
     const existing = this.hist.get(candleSymbol);
     if (existing) return new Promise((res) => { const prev = existing.resolve; existing.resolve = (b) => { prev(b); res(b); }; });
@@ -372,13 +419,28 @@ export class DxFeedProvider extends BaseProvider {
       const pending: HistPending = {
         bars: new Map(),
         resolve,
-        precision: inst.pricePrecision,
+        precision,
         idle: setTimeout(() => this.finishHistory(candleSymbol), HISTORY_IDLE_MS),
         cap: setTimeout(() => this.finishHistory(candleSymbol), HISTORY_MAX_MS),
       };
       this.hist.set(candleSymbol, pending);
       this.send({ type: "FEED_SUBSCRIPTION", channel: CHANNEL_HIST, add: [{ type: "Candle", symbol: candleSymbol, fromTime }] });
-    }).then((bars) => bars.slice(-count));
+    });
+  }
+
+  /** Extend a Candle snapshot with bars we built from live prints.
+   *
+   *  Serves two cases with one path: an endpoint WITH candle history gets its
+   *  publication-lag seam closed, and one WITHOUT (the demo host) gets a chart at
+   *  all. Only bars strictly newer than the snapshot are appended, so a real
+   *  snapshot always wins where the two overlap. */
+  private mergeLiveBars(symbol: string, snapshot: Candle[], resolutionSec: number, count: number): Candle[] {
+    const live = this.liveBars.get(symbol);
+    // The buffer is minute-grained, so it cannot build sub-minute resolutions.
+    if (resolutionSec < 60 || !live || live.length === 0) return snapshot.slice(-count);
+    const lastSnapshot = snapshot.length ? snapshot[snapshot.length - 1]!.time : 0;
+    const tail = aggregate(live, resolutionSec).filter((c) => c.time > lastSnapshot);
+    return (tail.length ? [...snapshot, ...tail] : snapshot).slice(-count);
   }
 
   private onCandle(e: Record<string, unknown>): void {
