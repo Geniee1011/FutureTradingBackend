@@ -31,11 +31,29 @@ export const config = {
   ) as "shared" | "byo" | "dxfeed",
 
   /** dxFeed (dxLink) real-time feed — used only when MARKET_DATA_MODE=dxfeed.
-   *  Defaults to the public demo endpoint so the wiring can be validated before
-   *  the operator drops in a production endpoint + token. */
+   *  Defaults to the public demo endpoint (four instruments, no entitlement) so
+   *  the wiring can be validated with no credentials at all. Set DXFEED_AUTH_LOGIN
+   *  / DXFEED_AUTH_PASSWORD to switch to the real, entitled staging/production
+   *  feed instead — the provider then mints its own endpoint+token from the auth
+   *  service on every (re)connect rather than using DXFEED_ENDPOINT/DXFEED_TOKEN
+   *  directly (see providers/dxfeed.ts). */
   dxfeed: {
     endpoint: process.env.DXFEED_ENDPOINT?.trim() || "wss://demo.dxfeed.com/market-data/dxlink-ws",
     token: process.env.DXFEED_TOKEN?.trim() ?? "",
+
+    /** Volumetrica auth service — mints a real dataEndpoint + dataToken per the
+     *  Admin Trading API's "AUTH REQUEST" (v2 path; v1 silently omits the market
+     *  data fields even on success — confirmed against staging 2026-08-27). */
+    auth: {
+      url: process.env.DXFEED_AUTH_URL?.trim() || "https://authdxfeed.volumetricatrading.com/api/v2/auth/token",
+      pltfKey: process.env.DXFEED_PLTF_KEY?.trim() ?? "",
+      login: process.env.DXFEED_AUTH_LOGIN?.trim() ?? "",
+      password: process.env.DXFEED_AUTH_PASSWORD?.trim() ?? "",
+      // Sending version 5 gets a 200 with the trading fields only, no market-data
+      // ones — 6 is what actually returns dataEndpoint/dataToken (confirmed live).
+      apiVersion: num("DXFEED_AUTH_API_VERSION", 6),
+      environment: num("DXFEED_AUTH_ENVIRONMENT", 1), // 0 = production, 1 = staging
+    },
   },
 
   jwt: {

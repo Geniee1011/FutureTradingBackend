@@ -105,11 +105,25 @@ export class DxFeedProvider extends BaseProvider {
    * Same approach DatabentoLiveProvider uses to bridge its publication lag. */
   private readonly liveBars = new Map<string, Candle[]>();
 
+  /** Static fallback (public demo, or a pre-minted DXFEED_ENDPOINT/TOKEN pair). */
+  private readonly staticEndpoint: string;
+  private readonly staticToken: string;
+  /** What connect() actually uses — overwritten by mintCredentials() each attempt
+   *  when auth.login/password are set; otherwise stays equal to the static pair. */
+  private activeEndpoint: string;
+  private activeToken: string;
+
   constructor(
-    private readonly endpoint: string,
-    private readonly token: string,
+    endpoint: string,
+    token: string,
+    private readonly auth: {
+      url: string; pltfKey: string; login: string; password: string;
+      apiVersion: number; environment: number;
+    },
   ) {
     super();
+    this.staticEndpoint = this.activeEndpoint = endpoint;
+    this.staticToken = this.activeToken = token;
     /* The demo host DOES serve real CME futures (verified 2026-08-24: /ES:XCME,
      * /CL:XNYM, /6E:XCME all quote live; the rest are silent). So the ETF stand-in
      * swap is no longer automatic — `DXFEED_DEMO=0` opts out explicitly.
@@ -145,7 +159,7 @@ export class DxFeedProvider extends BaseProvider {
   start(): void {
     if (this.running) return;
     this.running = true;
-    this.connect();
+    void this.connect();
   }
 
   stop(): void {
@@ -165,13 +179,55 @@ export class DxFeedProvider extends BaseProvider {
 
   // --- connection --------------------------------------------------
 
-  private connect(): void {
+  /** Volumetrica's Admin Trading API AUTH REQUEST, asked for market data
+   *  (connectOnlyTrading: false). Only the v2 path + apiVersion 6 actually
+   *  return dataEndpoint/dataToken — v1 (or version 5) returns HTTP 200 with
+   *  only the trading fields, no error, which looks like success and isn't
+   *  (confirmed against staging 2026-08-27). On failure, falls back to
+   *  whatever endpoint/token were last active (the static pair, first time). */
+  private async mintCredentials(): Promise<void> {
+    if (!this.auth.login || !this.auth.password) return; // static demo/pre-minted pair
+    try {
+      const res = await fetch(this.auth.url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", PltfKey: this.auth.pltfKey },
+        body: JSON.stringify({
+          login: this.auth.login,
+          password: this.auth.password,
+          withDetails: true,
+          version: this.auth.apiVersion,
+          environment: this.auth.environment,
+          connectOnlyTrading: false,
+        }),
+      });
+      const body = (await res.json().catch(() => ({}))) as Record<string, unknown>;
+      const data = (body.data ?? body) as Record<string, unknown>;
+      const endpoint = data.dataEndpoint as string | undefined;
+      const token = data.dataToken as string | undefined;
+      if (!res.ok || body.success === false || !endpoint || !token) {
+        console.warn(
+          `[dxfeed] auth request did not return market-data credentials (HTTP ${res.status}) — ` +
+            `using the last known endpoint/token. message: ${String(body.message ?? "")}`,
+        );
+        return;
+      }
+      this.activeEndpoint = endpoint;
+      this.activeToken = token;
+      const exchanges = Array.isArray(data.dataExchanges) ? data.dataExchanges.join(", ") : "?";
+      console.log(`[dxfeed] minted market-data credentials — exchanges: ${exchanges}`);
+    } catch (err) {
+      console.warn("[dxfeed] auth request failed:", (err as Error).message, "— using the last known endpoint/token");
+    }
+  }
+
+  private async connect(): Promise<void> {
+    await this.mintCredentials();
     this.authorized = false;
     this.channelOpen.clear();
-    const ws = new WebSocket(this.endpoint);
+    const ws = new WebSocket(this.activeEndpoint);
     this.ws = ws;
     ws.on("open", () => {
-      console.log("[dxfeed] socket open →", this.endpoint);
+      console.log("[dxfeed] socket open →", this.activeEndpoint);
       this.send({ type: "SETUP", channel: 0, version: PROTOCOL_VERSION, keepaliveTimeout: 60, acceptKeepaliveTimeout: 60 });
     });
     ws.on("message", (raw: WebSocket.RawData) => this.onMessage(raw));
@@ -188,7 +244,7 @@ export class DxFeedProvider extends BaseProvider {
     this.retries += 1;
     console.warn(`[dxfeed] disconnected (code ${code ?? "?"}) — reconnecting in ${delay}ms`);
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => void this.connect(), delay);
   }
 
   private send(msg: Record<string, unknown>): void {
@@ -233,8 +289,8 @@ export class DxFeedProvider extends BaseProvider {
     if (state === "UNAUTHORIZED") {
       // Real endpoints require a token; the public demo is open (goes straight to
       // AUTHORIZED). Only send AUTH when we actually have a token.
-      if (this.token) this.send({ type: "AUTH", channel: 0, token: this.token });
-      else console.warn("[dxfeed] server requires auth but DXFEED_TOKEN is unset — set it for a real endpoint");
+      if (this.activeToken) this.send({ type: "AUTH", channel: 0, token: this.activeToken });
+      else console.warn("[dxfeed] server requires auth but no token is available — set DXFEED_TOKEN or DXFEED_AUTH_LOGIN/PASSWORD");
       return;
     }
     if (state === "AUTHORIZED") {

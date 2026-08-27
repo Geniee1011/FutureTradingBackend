@@ -39,11 +39,15 @@ function buildProvider(): MarketDataProvider {
   // fanned out to charts + used as marks), but sourced from dxFeed instead of
   // Databento. Purely additive: the Databento branches below are unchanged.
   if (config.marketDataMode === "dxfeed") {
-    console.log("[provider] Market-data model: dxFeed (dxLink WebSocket) —", config.dxfeed.endpoint);
-    if (!config.dxfeed.token) {
-      console.warn("[provider] MARKET_DATA_MODE=dxfeed with no DXFEED_TOKEN — OK for the public demo feed; set it for a production endpoint.");
+    if (config.dxfeed.auth.login && config.dxfeed.auth.password) {
+      console.log("[provider] Market-data model: dxFeed (dxLink WebSocket) — authenticated, endpoint minted per-connection");
+    } else {
+      console.log("[provider] Market-data model: dxFeed (dxLink WebSocket) —", config.dxfeed.endpoint);
+      if (!config.dxfeed.token) {
+        console.warn("[provider] MARKET_DATA_MODE=dxfeed with no credentials — OK for the public demo feed; set DXFEED_AUTH_LOGIN/PASSWORD for entitled data.");
+      }
     }
-    return new DxFeedProvider(config.dxfeed.endpoint, config.dxfeed.token);
+    return new DxFeedProvider(config.dxfeed.endpoint, config.dxfeed.token, config.dxfeed.auth);
   }
 
   // Model A — "shared": one master key, fanned out to all users (current behaviour).
