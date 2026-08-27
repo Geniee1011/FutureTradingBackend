@@ -60,6 +60,32 @@ export abstract class BaseProvider extends EventEmitter implements MarketDataPro
 }
 
 /** Round a number to a fixed number of decimals. */
+/**
+ * Aggregate minute-grained candles (e.g. a live trade-built buffer) into
+ * `resolutionSec` buckets. Identity for resolutions <= 60s.
+ *
+ * Lives here rather than beside one provider because every live feed needs it:
+ * a provider that builds bars from trade prints can only build them per minute,
+ * so any coarser chart resolution has to be folded up from those.
+ */
+export function aggregateCandles(oneMin: Candle[], resolutionSec: number): Candle[] {
+  if (resolutionSec <= 60) return oneMin.slice();
+  const buckets = new Map<number, Candle>();
+  for (const m of oneMin) {
+    const bucket = m.time - (m.time % resolutionSec);
+    const ex = buckets.get(bucket);
+    if (!ex) {
+      buckets.set(bucket, { ...m, time: bucket });
+    } else {
+      ex.high = Math.max(ex.high, m.high);
+      ex.low = Math.min(ex.low, m.low);
+      ex.close = m.close;
+      ex.volume += m.volume;
+    }
+  }
+  return [...buckets.values()].sort((a, b) => a.time - b.time);
+}
+
 export function round(value: number, decimals: number): number {
   const f = 10 ** decimals;
   return Math.round(value * f) / f;

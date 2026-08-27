@@ -82,28 +82,9 @@ export async function fetchDailyStats(client: DatabentoClient, dbSymbol: string)
   };
 }
 
-/**
- * Aggregate minute-grained candles (e.g. a live trade-built buffer) into
- * `resolutionSec` buckets. Identity for resolutions <= 60s. Used to merge the
- * live provider's rolling 1-minute bars into a higher-resolution history series.
- */
-export function aggregateCandles(oneMin: Candle[], resolutionSec: number): Candle[] {
-  if (resolutionSec <= 60) return oneMin.slice();
-  const buckets = new Map<number, Candle>();
-  for (const m of oneMin) {
-    const bucket = m.time - (m.time % resolutionSec);
-    const ex = buckets.get(bucket);
-    if (!ex) {
-      buckets.set(bucket, { ...m, time: bucket });
-    } else {
-      ex.high = Math.max(ex.high, m.high);
-      ex.low = Math.min(ex.low, m.low);
-      ex.close = m.close;
-      ex.volume += m.volume;
-    }
-  }
-  return [...buckets.values()].sort((a, b) => a.time - b.time);
-}
+/* Moved to provider.ts — every live feed needs it, not just this one. Re-exported
+ * so existing importers here are unaffected. */
+export { aggregateCandles } from "./provider.js";
 
 function toCandle(b: OhlcvRecord, p: number): Candle {
   return {
