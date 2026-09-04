@@ -140,7 +140,20 @@ export function createMarketServer(hub: MarketHub, opts: ServerOptions) {
 }
 
 function handleHttp(req: IncomingMessage, res: ServerResponse, hub: MarketHub, opts: ServerOptions) {
-  res.setHeader("Access-Control-Allow-Origin", opts.corsOrigin);
+  // CORS_ORIGIN may be "*", a single origin, or a comma-separated allowlist (the
+  // production domain + the Vercel URL + previews). The header itself takes only
+  // ONE value, so reflect the request Origin when it is on the list. An unknown
+  // origin falls back to the first entry and is still refused by the browser.
+  const allow = opts.corsOrigin.trim();
+  let allowOrigin = "*";
+  if (allow !== "*") {
+    const list = allow.split(",").map((o) => o.trim()).filter(Boolean);
+    const origin = req.headers.origin;
+    allowOrigin = origin && list.includes(origin) ? origin : (list[0] ?? "*");
+    // Without this, a cache can serve the response for one origin to another.
+    res.setHeader("Vary", "Origin");
+  }
+  res.setHeader("Access-Control-Allow-Origin", allowOrigin);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
 
